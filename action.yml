@@ -14,7 +14,7 @@ inputs:
   version:
     description: The version of the binary the action installs (the tag of the release).
     required: false
-    default: v0.5.0
+    default: v0.5.1
   config:
     description: The path of the config, relative to the workspace.
     required: false

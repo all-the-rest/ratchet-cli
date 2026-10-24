@@ -86,3 +86,9 @@ block is written by `ratchet release`.
 ### Added
 
 - use GitHub CLI token fallback (issues)
+
+## [0.5.1] - 2026-10-24
+
+### Fixed
+
+- ignore unselected symlink files (file-metrics)
