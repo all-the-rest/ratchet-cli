@@ -5,7 +5,7 @@ that compare a **count** against a **baseline** that may only move in one
 declared direction, plus **drift gates** for generated files.
 
 **Rules only, no decisions.** Durable decisions live in `SPEC.md`; open work in
-`AGENTS.todo.md`.
+GitHub Issues.
 
 ## Language
 
@@ -43,7 +43,24 @@ check and the opt-in `issues` counter — a project that does not configure
 One Conventional Commit per self-contained change
 (`feat|fix|docs|refactor|test|chore|perf` + optional scope). `git add` with
 explicit paths — never `git add -A`. Verify with `git show --stat` before
-committing.
+committing. The merge queue squashes, so `main` carries one commit per PR;
+amend only unpushed commits.
+
+## Open work — GitHub Issues
+
+Every actionable item is a GitHub issue with a Conventional-commit-style title,
+one severity label (`severity:critical`, `severity:high`, `severity:medium`,
+`severity:low` or `severity:info`) and an assignee. A pull request closes its
+issue with `Closes #N`. There is no `AGENTS.todo.md` in this repository.
+
+## Branches, commits, pull requests
+
+Never commit to `main`. Branches use `<type>/<slug>`. Use one Conventional
+Commit per self-contained change, stage explicit paths, and verify with
+`git show --stat`. A pull request names the issue it closes and its verification.
+The required CI checks are the three matrix jobs (`ubuntu-latest`,
+`macos-latest`, `windows-latest`). Merge only through the merge queue with
+`gh pr merge`; never use `--admin` and never push directly to `main`.
 
 ## Design rules that are not negotiable
 

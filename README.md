@@ -73,6 +73,21 @@ ratchet update          # update the binary to the newest release
 ratchet init            # write a starter config
 ```
 
+## Contributing
+
+Open work lives in GitHub Issues. Branch from `main`, run the green commands
+locally, then open a PR that closes the issue:
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo build && ./target/debug/ratchet check
+```
+
+The checks run on pull requests and on `merge_group`; merge through the queue,
+which squashes the PR into one commit on `main`.
+
 ## Configuration
 
 The config is the only source of truth for the rules. It is a *flat* config in

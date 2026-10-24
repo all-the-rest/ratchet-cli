@@ -1,0 +1,38 @@
+name: Task
+description: An actionable piece of open work.
+labels: ["severity:medium"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Set the matching `severity:*` label and an assignee after creating the
+        issue — an issue form cannot apply a label from the dropdown.
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What is true when this is done?
+    validations:
+      required: true
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - critical
+        - high
+        - medium
+        - low
+        - info
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Why now? Include the incident that motivated this.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance
+      description: How will this be verified?
