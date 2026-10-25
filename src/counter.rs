@@ -185,12 +185,28 @@ fn validate_measurement_files(value: &CounterValue, root: &Path) -> Result<(), C
     Ok(())
 }
 
+/// The final count and the `exclude` patterns that matched nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finalized {
+    /// The count after `exclude`.
+    pub count: i64,
+    /// The indices of the `exclude` patterns that matched no item.
+    ///
+    /// A dead pattern is a note, never a failure: the engine never mutates the
+    /// config, so there is nothing to prune (SPEC 5.2).
+    pub unmatched_excludes: Vec<usize>,
+}
+
 /// Applies `exclude` to the items and turns the value into the final count.
+///
+/// `exclude` is grouped: one inner slice per configured pattern, because a
+/// pattern can expand into more than one matcher (SPEC 3.7).  The index of a
+/// group is therefore the index of the pattern.
 pub fn finalize(
     value: CounterValue,
-    exclude: &[GlobMatcher],
+    exclude: &[Vec<GlobMatcher>],
     exclude_path: &str,
-) -> Result<i64, CounterError> {
+) -> Result<Finalized, CounterError> {
     let CounterValue {
         count,
         items,
@@ -207,13 +223,29 @@ pub fn finalize(
         items.sort();
         if exclude.is_empty() {
             let count = count.unwrap_or(items.len() as i64);
-            return non_negative(count);
+            return Ok(Finalized {
+                count: non_negative(count)?,
+                unmatched_excludes: Vec::new(),
+            });
         }
+        let unmatched_excludes = exclude
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| {
+                !group
+                    .iter()
+                    .any(|glob| items.iter().any(|item| glob.is_match(item)))
+            })
+            .map(|(index, _)| index)
+            .collect();
         let kept = items
             .iter()
-            .filter(|item| !exclude.iter().any(|glob| glob.is_match(item)))
+            .filter(|item| !exclude.iter().flatten().any(|glob| glob.is_match(item)))
             .count() as i64;
-        return non_negative(kept);
+        return Ok(Finalized {
+            count: non_negative(kept)?,
+            unmatched_excludes,
+        });
     }
 
     if !exclude.is_empty() {
@@ -223,7 +255,10 @@ pub fn finalize(
     }
 
     let count = count.ok_or_else(|| CounterError::runtime("the counter did not print a count"))?;
-    non_negative(count)
+    Ok(Finalized {
+        count: non_negative(count)?,
+        unmatched_excludes: Vec::new(),
+    })
 }
 
 /// Reduces file measurements using a configured aggregate.
@@ -996,22 +1031,51 @@ mod tests {
     #[test]
     fn counts_the_items_of_an_array() {
         let value = parse_counter_output(r#"["a.ts", "b.ts"]"#).expect("parses");
-        let count = finalize(value, &[], "rules.a.exclude").expect("counts");
-        assert_eq!(count, 2);
+        let finalized = finalize(value, &[], "rules.a.exclude").expect("counts");
+        assert_eq!(finalized.count, 2);
+        assert!(finalized.unmatched_excludes.is_empty());
     }
 
     #[test]
-    fn exclude_removes_items_from_the_count() {
+    fn exclude_removes_items_from_the_count_and_names_a_dead_pattern() {
         let value =
             parse_counter_output(r#"["src/a.ts", "src/b.ts", "docs/c.ts"]"#).expect("parses");
-        let count = finalize(value, &[matcher("src/**")], "rules.a.exclude").expect("counts");
-        assert_eq!(count, 1);
+        let finalized = finalize(
+            value,
+            &[vec![matcher("src/**")], vec![matcher("vendor/**")]],
+            "rules.a.exclude",
+        )
+        .expect("counts");
+        assert_eq!(finalized.count, 1);
+        assert_eq!(finalized.unmatched_excludes, vec![1]);
+    }
+
+    #[test]
+    fn grouped_exclude_names_the_dead_pattern_after_an_expansion() {
+        // `a/**` expands into two matchers; the group keeps them attached to
+        // the pattern, so `dead/**` is the one that is reported.
+        let exclude = crate::config::compile_globs_grouped(
+            &[
+                "a/**".to_string(),
+                "b/**".to_string(),
+                "dead/**".to_string(),
+            ],
+            "rules.a.exclude",
+        )
+        .expect("valid globs");
+        assert_eq!(exclude.len(), 3, "one group per pattern");
+        assert_eq!(exclude[0].len(), 2, "`a/**` expands to the directory too");
+        let value = parse_counter_output(r#"["a/one.ts", "b/two.ts"]"#).expect("parses");
+        let finalized = finalize(value, &exclude, "rules.a.exclude").expect("counts");
+        assert_eq!(finalized.count, 0);
+        assert_eq!(finalized.unmatched_excludes, vec![2]);
     }
 
     #[test]
     fn exclude_on_a_scalar_counter_is_a_config_error() {
         let value = parse_counter_output("5").expect("parses");
-        let error = finalize(value, &[matcher("src/**")], "rules.a.exclude").expect_err("fails");
+        let error =
+            finalize(value, &[vec![matcher("src/**")]], "rules.a.exclude").expect_err("fails");
         assert!(error.is_config);
         assert!(error.message.contains("rules.a.exclude"));
     }

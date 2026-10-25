@@ -319,9 +319,14 @@ pub struct Rule {
     /// Named path scopes. Exact-file scopes take precedence over glob scopes.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<PathScope>,
-    /// Compiled `exclude` patterns.
+    /// The compiled `exclude` patterns, one group per configured pattern.
+    ///
+    /// A pattern can expand into more than one matcher (`src/**` also matches
+    /// the directory `src`), so a flat vector would not be aligned with
+    /// `exclude`.  One inner vector per original pattern keeps the two in
+    /// step: the index of a group is the index of the pattern.
     #[serde(skip)]
-    pub exclude_globs: Vec<GlobMatcher>,
+    pub exclude_globs: Vec<Vec<GlobMatcher>>,
     /// Compiled `files` patterns.
     #[serde(skip)]
     pub file_globs: Vec<GlobMatcher>,
@@ -1104,7 +1109,7 @@ fn parse_rule(id: &str, value: &Value) -> Result<Rule, ConfigError> {
             "scoped metrics require per-file measurements",
         ));
     }
-    let exclude_globs = compile_globs(&exclude, &format!("{path}.exclude"))?;
+    let exclude_globs = compile_globs_grouped(&exclude, &format!("{path}.exclude"))?;
     let file_globs = compile_globs(&files, &format!("{path}.files"))?;
 
     Ok(Rule {
@@ -1504,11 +1509,29 @@ fn optional_statuses(
 
 /// Compiles glob patterns into matchers.
 ///
-/// The patterns are the ones of a config (`exclude`, `files`) and the ones of
-/// the command line (`--ignore`); the same rules apply to all of them.
+/// The patterns are the ones of a config (`files`, `file_metrics.files`, the
+/// scopes) and the ones of the command line (`--ignore`); the same rules apply
+/// to all of them.
 pub fn compile_globs(patterns: &[String], path: &str) -> Result<Vec<GlobMatcher>, ConfigError> {
-    let mut compiled = Vec::new();
+    Ok(compile_globs_grouped(patterns, path)?
+        .into_iter()
+        .flatten()
+        .collect())
+}
+
+/// Compiles glob patterns into matchers, one group per original pattern.
+///
+/// A pattern can expand into more than one matcher (`src/**` also matches the
+/// directory `src`, SPEC 3.7), so the expansion has to stay attached to the
+/// pattern it came from.  The index of a group is the index of the pattern in
+/// `patterns`.
+pub fn compile_globs_grouped(
+    patterns: &[String],
+    path: &str,
+) -> Result<Vec<Vec<GlobMatcher>>, ConfigError> {
+    let mut compiled = Vec::with_capacity(patterns.len());
     for original in patterns {
+        let mut group = Vec::new();
         for pattern in glob_patterns(original) {
             let glob = GlobBuilder::new(&pattern)
                 .literal_separator(true)
@@ -1516,8 +1539,9 @@ pub fn compile_globs(patterns: &[String], path: &str) -> Result<Vec<GlobMatcher>
                 .map_err(|e| {
                     ConfigError::new(path, format!("invalid glob pattern \"{original}\": {e}"))
                 })?;
-            compiled.push(glob.compile_matcher());
+            group.push(glob.compile_matcher());
         }
+        compiled.push(group);
     }
     Ok(compiled)
 }

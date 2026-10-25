@@ -789,8 +789,8 @@ reason travels with the record, so the diff on the baseline file carries it.
 |---|---|
 | `ratchet [check] [paths…]` | Runs every gate and compares the count with the baseline. The default command. `paths…` restricts the run to the rules whose `files` scope touches them; a path that does not exist is an operational error. |
 | `ratchet count` | Prints the current count per rule, without a comparison. |
-| `ratchet baseline init` | Writes the current count as the baseline of every rule that has none. Existing baselines are never touched. |
-| `ratchet baseline update` | Moves the baseline towards the current count — **only** in the allowed direction. A ceiling may only decrease, a floor may only increase. A rule that may not move is reported as refused and left alone. |
+| `ratchet baseline init` | Writes the current count as the baseline of every rule that has none. Existing baselines are never touched. Without `--strict` it **documents** stale records and leaves them be; with `--strict` it refuses **before writing** if any stale artifact exists. |
+| `ratchet baseline update` | Moves the baseline towards the current count — **only** in the allowed direction. A ceiling may only decrease, a floor may only increase. A rule that may not move is reported as refused and left alone. It is also the cleanup step: it **prunes** stale rule and scope records. |
 | `ratchet baseline path` | Prints the **repository-relative path** of the baseline file — the path the binary itself uses, and nothing else. It is the answer to "which file is my baseline?" for a script outside the binary: the resolution lives in one place, and a second implementation answers a different question than the binary. |
 | `ratchet baseline raise` | Moves a baseline **against** its declared direction, on purpose, with a reason. A ceiling goes up, a floor goes down. The reason is required, and it travels with the record — see below. |
 | `ratchet drift` | Runs the drift gates — the generated files — and nothing else. `--path` restricts the run to one generated file. |
@@ -808,6 +808,7 @@ reason travels with the record, so the diff on the baseline file carries it.
 | `--no-config` | Do not look for a config; only valid together with `--config`. |
 | `--format <stylish\|json\|md>` | The output format, `stylish` by default. `md` belongs to the `report` command: the other commands print the stylish output or the JSON document. |
 | `--rule <id>` | Restrict the run to one rule. |
+| `--strict` | Fail closed on **stale artifacts** — a baseline record for a rule or scope the config no longer has, and a configured scope that selects no files. Meaningful for `check`, `report` and `baseline init`; accepted as a no-op everywhere else. |
 | `--fix` | Apply the fixable: write the produced content into the generated files. The gate stays failed until the fix is committed. A `check` and a `drift` option — the `report` writes a report and changes nothing else. |
 | `--name <name>` | Run only the check of this name. A `verify` option. |
 | `--update` | Write the produced output into the snapshots. A `verify` option: the snapshot is machine-written, and the check stays failed until the snapshot is committed. |
@@ -902,6 +903,59 @@ ignored path still runs on the rest.
 `--ignore` applies to the **rules' path scope**. It does not exclude a drift
 gate: a generated file is registered deliberately, and a pattern that happens
 to match it must not silently disable the gate.
+
+### Stale artifacts
+
+An artifact that was an exception once and is not one any more is a **stale
+artifact**: a baseline record for a rule the config no longer has, a baseline
+scope record for a scope the rule no longer configures, or a configured scope
+of a per-file measurement rule that selects no file (its file was deleted, for
+example).
+
+By default a stale artifact never fails a run. It is reported as a note, and
+the gate still runs on everything that is still configured:
+
+```sh
+$ ratchet check
+ratchet: note: baseline record for unknown rule "legacy-login" — ignored (run ratchet baseline update to prune it)
+ratchet: note: baseline scope "old-module" for rule "file-size" is not configured — ignored (run ratchet baseline update to prune it)
+ratchet: note: rule file-size scope auth-legacy selects no files — ignored (remove the scope from the config)
+```
+
+A baseline record carries the `ratchet baseline update` hint; a configured
+scope that selects no file carries the hint to remove the scope from the
+config, because the engine never edits the config.
+
+A configured scope that selects no file is skipped for that scope only: the
+rule's other scopes and the global fallback still run and are compared. A rule
+whose counter selects no file **at all** is still a counter error, and a run
+whose executed checks drop to zero still fails — an empty selection is never a
+pass.
+
+`--strict` restores the fail-closed behaviour for the run where a typo must
+not be silently green: every stale artifact is an operational error (exit `2`)
+and is named, and an empty configured scope is today's
+`scope <id> (<description>) selected no files`. `report --strict` exits `2`
+when the report is NOT COHERENT because of a stale artifact.
+
+An `exclude` pattern that matches nothing is **always a note**, in every mode:
+`exclude pattern "<pattern>" for rule "<rule>" matches nothing — ignored`. It
+is never an error — not even under `--strict` — and it is never pruned,
+because the engine never mutates the config.
+
+`baseline update` is the cleanup step: it prunes the stale records (it is
+always tolerant, `--strict` has no effect there). A pruned scope id that is
+re-introduced later starts without a record — the next `baseline init` writes
+the fresh value, never the old one. It removes only the baseline record of a
+scope that is still configured but selects no files; under `--strict` the
+scope stays a stale artifact until the project removes it from the config,
+because the engine never mutates the config.
+
+`baseline init` without `--strict` **documents**: it leaves stale records in
+place and exits `0`, so a baseline can be initialized on an old tree. With
+`--strict` it validates first — including running the counters of the
+per-file measurement rules — and refuses without writing anything if a stale
+artifact exists.
 
 ## The output
 

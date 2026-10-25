@@ -297,7 +297,13 @@ Named scopes take this shape:
 Exact files take precedence over module globs. Among globs, the greatest
 literal/component specificity wins; equal specificity is an error. Unmatched
 files contribute only to the global fallback. A configured scope that selects
-no files is an error. The rule-level `description` labels the global fallback.
+no files is a **stale artifact** (§5.2): it is a note by default and an error
+only under `--strict`. A scope whose files exist but are all removed by
+`exclude` is not stale; it is simply not measured. Scope assignment and the
+ambiguity check happen **before** `exclude`: an excluded path is still
+assigned, so an ambiguous scope configuration surfaces even when every
+ambiguous path is excluded. The rule-level `description` labels the global
+fallback.
 
 ### 3.5 Unknown fields
 
@@ -394,6 +400,7 @@ The default command is `check`.
 | `--fix` | apply the fixable: regenerate generated files — a **`check`/`drift`** option, not a global one |
 | `--tier <fast\|slow>` | run only the rules of that tier — a `check` option |
 | `--rule <id>` | restrict to one rule |
+| `--strict` | fail closed on stale artifacts — a baseline record for a rule or scope the config no longer has, and a configured scope that selects no files; meaningful for `check`, `report` and `baseline init`, accepted (no-op) everywhere else |
 | `--scope <id>` | address one named scope — `baseline raise` only |
 | `--ignore <pattern>` | glob of paths to exclude from the run (repeatable) |
 | `--name <name>` | run only this check — a `verify` option |
@@ -448,6 +455,40 @@ match it must not silently disable the gate.
    error** (exit 2).
 7. Exit code: `0` all green, `1` at least one gate failed, `2` operational error.
 
+**Stale artifacts.** An exception artifact is *stale* when it belongs to
+something the config no longer has:
+
+* a baseline rule record whose rule is not configured;
+* a baseline scope record whose scope that rule does not configure;
+* a configured scope of a per-file measurement rule that selects no file.
+
+Without `--strict` a stale artifact is a **note**, never a failure: the run is
+green when everything still configured is green. A baseline record is named
+with the hint `ratchet baseline update` (which prunes it, §5.5); a configured
+scope that selects no file is named with the hint to remove the scope from the
+config, because the engine never edits the config. A configured scope that
+selects no file is skipped with a note for that scope only — the rule's other
+scopes and the global fallback still run and are compared. There is no pruning
+in `check`.
+
+With `--strict` stale artifacts are **operational errors** (exit 2), one
+message per artifact, and the run does not stop at the first. An empty
+configured scope is today's counter error `scope <id> (<description>) selected
+no files`; the rule contributes no measured result, and under `--strict` that
+counter error is exit `2`. `report --strict` exits `2` as well when the
+produced report is NOT COHERENT because of a stale artifact.
+
+An `exclude` pattern that matches nothing is **always a note**, in every mode:
+`exclude pattern "<pattern>" for rule "<rule>" matches nothing — ignored`. It
+is never an error — not even under `--strict` — and it is never pruned,
+because the engine never mutates the config.
+
+The tolerance never makes an empty selection a pass: a run whose executed
+checks drop to zero still fails. A rule whose counter selects no file at all —
+no configured scope and no global fallback — is still a counter error. With
+`--rule` the run does not check unknown rule records (naming a removed rule
+already fails), and it checks only that rule's scope records and scopes.
+
 `paths…` restrict the run to the rules whose counter is affected by those
 paths. A rule without a path scope always runs. A rule may declare
 `"files": ["src/**"]` to scope it; the rule is skipped when the selected paths
@@ -465,6 +506,26 @@ Writes the **current count** as the baseline for every rule that has no
 baseline yet. Existing baselines are never touched. `--rule` restricts it to
 one rule. Touches only the baseline file.
 
+Without `--strict` it **documents**: stale artifacts (§5.2) are left in place
+and never fail the command. A baseline record for a removed rule, and a
+baseline scope record for a removed scope, stay untouched — each is reported
+as an `ignored` action saying so. A configured scope that selects no file
+writes no record for itself and is reported as `ignored` as well. A rule
+without `scopes`/`aggregate` that already has a baseline is still not counted,
+even when its counter is broken; a per-file measurement rule (one with
+`scopes` or `aggregate`) is counted regardless, because its scopes must be
+validated.
+
+With `--strict` the command validates **before it writes**. It collects the
+unknown rule records (unless `--rule`), the unknown scope records, and the
+empty configured scopes — the last by running the counter of every per-file
+measurement rule, even one that already has a baseline. A counter failure
+during this pre-flight is an operational error. If any stale artifact exists
+the command exits `2`, lists every one of them, and the baseline file is
+byte-identical afterwards: nothing is written, not even a parent directory.
+If none exists it behaves like the default init and writes the missing
+baselines.
+
 ### 5.5 `baseline update` (the paydown)
 
 Moves the baseline to the current count, **only in the allowed direction**:
@@ -478,6 +539,25 @@ Rules that may not move are reported as refused and are **not** modified; the
 command then exits `1` so the refusal is noticed. `--rule` restricts it to one
 rule. `--reason <text>` is stored in the baseline record. Touches only the
 baseline file. Never runs automatically.
+
+`baseline update` is also the **cleanup step**, and it is always tolerant:
+`--strict` has no effect here. It prunes every stale artifact (§5.2) from the
+baseline and reports each as `pruned`:
+
+* a record for a rule that is no longer configured — without `--rule`;
+* a scope record for a scope the rule no longer configures — `--rule` limits
+  this to that rule;
+* the record of a configured scope that selects no file — only when the
+  counter ran successfully, because an empty scope cannot be detected
+  otherwise.
+
+Pruning counts as a change, is saved with the rest, and is never a failure.
+`baseline update` removes only the baseline record of a scope that is still
+configured but selects no files; under `--strict` the scope stays a stale
+artifact until the project removes it from the config, because the engine
+never mutates the config.
+A pruned scope id that is re-introduced later has no record: the next
+`baseline init` writes the fresh value, never the old one.
 
 A move **against** the declared direction is possible only as its own
 deliberate command:
@@ -527,6 +607,12 @@ characters plus a two-space separator, and the unit is separated by two spaces.
 The example is the byte-exact output of the binary — the test
 `the_stylish_output_is_the_documented_one` compares the whole stdout against
 it, so the document cannot drift away from the implementation.
+
+Under `--strict`, every NOT-COHERENT headline appends the stale-artifact count
+when the run has at least one — not only when they are the sole failure:
+`NOT COHERENT — N of M gates failed, K stale artifact(s)` — `stale artifact`
+for one, `stale artifacts` for more. A stale artifact is not a gate, so `N`
+and `M` count only the gates; the JSON schema is unchanged.
 
 Every path in the output is **relative to the repository root**. An absolute
 path, a machine name or a timestamp makes the same tree produce different

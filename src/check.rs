@@ -8,6 +8,7 @@ use crate::counter;
 use crate::drift::DriftEntry;
 use crate::git::Git;
 use crate::registry::Finding;
+use crate::stale;
 
 /// The status of one rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +123,21 @@ pub struct Report {
     pub executed: usize,
     /// The number of rules whose counter failed.
     pub counter_errors: usize,
+    /// The part of `counter_errors` that is a configured scope selecting no
+    /// files.
+    ///
+    /// It is incremented by `check` under `--strict` and by `count`, which has
+    /// no strict mode: an empty scope is an error there too (SPEC 5.2).
+    ///
+    /// Such a result is a `CounterError`, but the counter itself ran fine: its
+    /// output cannot explain the empty scope, so the debug hint is suppressed
+    /// when every counter error has this cause.
+    pub empty_scope_errors: usize,
+    /// The number of stale artifacts under `--strict`.
+    ///
+    /// Without `--strict` the artifacts are notes, not errors: the run is
+    /// tolerant of records the config no longer configures (SPEC 5.2).
+    pub stale_errors: usize,
     /// Notes about what was skipped and why.
     pub notes: Vec<String>,
     /// The debug log (`--debug`).
@@ -137,6 +153,8 @@ impl Default for Report {
             generated: Vec::new(),
             executed: 0,
             counter_errors: 0,
+            empty_scope_errors: 0,
+            stale_errors: 0,
             notes: Vec::new(),
             debug: Vec::new(),
             ok: true,
@@ -190,6 +208,11 @@ pub struct Selection<'a> {
     pub paths: &'a [String],
     /// The paths to exclude from the selection.
     pub ignore: &'a [GlobMatcher],
+    /// Fail closed on stale artifacts instead of noting them.
+    ///
+    /// The default is tolerant: a record the config no longer configures and
+    /// a configured scope that selects no files are notes (SPEC 5.2).
+    pub strict: bool,
 }
 
 impl Selection<'_> {
@@ -258,6 +281,16 @@ pub fn check(
     selection: &Selection<'_>,
 ) -> Report {
     let mut report = Report::default();
+    // Stale artifacts are accumulated as they are found: every one is
+    // reported, not only the first (SPEC 5.2).  Without `--strict` each is a
+    // note; with it each is an operational error.
+    let mut stale: Vec<stale::Stale> = Vec::new();
+    // A rule record that the config no longer has is checked for every run
+    // that is not restricted to a rule: naming a removed rule already fails
+    // in `ensure_rule_exists`.
+    if selection.rule.is_none() {
+        stale.extend(stale::unknown_rules(config, baseline));
+    }
 
     for (id, rule) in &config.rules {
         if let Some(filter) = selection.rule {
@@ -271,6 +304,9 @@ pub fn check(
             ));
             continue;
         }
+        // The scope records of the rules this run processes: a scope the rule
+        // no longer configures is stale (SPEC 5.2).
+        stale.extend(stale::unknown_scopes(rule, baseline));
         report.executed += 1;
 
         let run = match counter::run_counter(&rule.count, root, &format!("rules.{id}.count")) {
@@ -294,8 +330,40 @@ pub fn check(
                     continue;
                 }
             };
-            report.executed = report.executed.saturating_sub(1) + scoped.len();
-            for (scope_id, description, count) in scoped {
+            // A dead `exclude` pattern is always a note: the engine never
+            // mutates the config, so there is nothing to prune and `--strict`
+            // does not fail on it (SPEC 5.2).
+            push_unmatched_excludes(&mut report, id, rule, &scoped.unmatched_excludes);
+            // A configured scope that selects no file is stale: without
+            // `--strict` it is skipped with a note, with `--strict` it is
+            // today's error (SPEC 5.2).
+            if selection.strict && !scoped.empty.is_empty() {
+                for (scope_id, description) in &scoped.empty {
+                    push_counter_error(
+                        &mut report,
+                        id,
+                        rule,
+                        counter::CounterError::runtime(format!(
+                            "scope {scope_id} ({description}) selected no files"
+                        )),
+                    );
+                    // The counter ran and delivered its measurements; only
+                    // the scope is empty, so the output explains nothing.
+                    report.empty_scope_errors += 1;
+                }
+                continue;
+            }
+            // Only the tolerant path records the empty scope as a stale note:
+            // under `--strict` the counter error above already names it.
+            for (scope_id, description) in &scoped.empty {
+                stale.push(stale::Stale::EmptyScope {
+                    rule: id.clone(),
+                    scope: scope_id.clone(),
+                    description: description.clone(),
+                });
+            }
+            report.executed = report.executed.saturating_sub(1) + scoped.entries.len();
+            for (scope_id, description, count) in scoped.entries {
                 let scope_record = scope_id
                     .as_deref()
                     .and_then(|scope| baseline.get(id).and_then(|record| record.scopes.get(scope)));
@@ -378,17 +446,19 @@ pub fn check(
             );
             continue;
         }
-        let count = match counter::finalize(
+        let finalized = match counter::finalize(
             run.value,
             &rule.exclude_globs,
             &format!("rules.{id}.exclude"),
         ) {
-            Ok(count) => count,
+            Ok(finalized) => finalized,
             Err(error) => {
                 push_counter_error(&mut report, id, rule, error);
                 continue;
             }
         };
+        push_unmatched_excludes(&mut report, id, rule, &finalized.unmatched_excludes);
+        let count = finalized.count;
         report.debug.push(format!("counter {id}: count {count}"));
 
         let record = baseline.get(id);
@@ -489,8 +559,20 @@ pub fn check(
         });
     }
 
+    // The stale artifacts are named in every mode: a note by default, an
+    // operational error under `--strict` (SPEC 5.2).
+    for artifact in &stale {
+        report.notes.push(artifact.check_note(selection.strict));
+        if selection.strict {
+            report.stale_errors += 1;
+        }
+    }
+
     // An empty selection is never a pass.
-    report.ok = report.failed() == 0 && report.counter_errors == 0 && report.executed > 0;
+    report.ok = report.failed() == 0
+        && report.counter_errors == 0
+        && report.stale_errors == 0
+        && report.executed > 0;
     report
 }
 
@@ -577,6 +659,21 @@ fn plural(count: usize, word: &str) -> String {
     }
 }
 
+/// Records the `exclude` patterns that matched nothing.
+///
+/// A dead pattern is always a note, in every mode: the engine never mutates
+/// the config, so there is nothing to prune and `--strict` does not fail on
+/// it (SPEC 5.2).
+fn push_unmatched_excludes(report: &mut Report, id: &str, rule: &Rule, indices: &[usize]) {
+    for index in indices {
+        if let Some(pattern) = rule.exclude.get(*index) {
+            report.notes.push(format!(
+                "exclude pattern \"{pattern}\" for rule \"{id}\" matches nothing — ignored"
+            ));
+        }
+    }
+}
+
 /// Records a counter that did not deliver a usable count.
 fn push_counter_error(report: &mut Report, id: &str, rule: &Rule, error: counter::CounterError) {
     report.counter_errors += 1;
@@ -619,6 +716,13 @@ mod scoped_tests {
         crate::config::parse_config_str(&text).expect("valid config")
     }
 
+    fn config_with_exclude(scopes: &str, exclude: &str) -> Config {
+        let text = r#"{"rules":{"r":{"class":"growth","incident":"test","unit":"files","direction":"ceiling","aggregate":"count","count":{"command":["echo","{}"]},"exclude":EXCLUDE,"scopes":SCOPES}}}"#
+            .replace("SCOPES", scopes)
+            .replace("EXCLUDE", exclude);
+        crate::config::parse_config_str(&text).expect("valid config")
+    }
+
     #[test]
     fn exact_file_beats_nested_module_and_nested_module_beats_broad_module() {
         let config = config(
@@ -644,7 +748,9 @@ mod scoped_tests {
         ];
         let groups =
             scoped_counts(config.rules.get("r").expect("rule"), &values).expect("scopes resolve");
+        assert!(groups.empty.is_empty());
         let grouped: std::collections::BTreeMap<_, _> = groups
+            .entries
             .into_iter()
             .map(|(id, _, value)| (id, value))
             .collect();
@@ -654,7 +760,7 @@ mod scoped_tests {
     }
 
     #[test]
-    fn equal_specificity_and_empty_scope_fail_closed() {
+    fn equal_specificity_fails_closed_and_an_empty_scope_is_reported() {
         let tied = config(
             r#"[
           {"id":"one","description":"One","files":["src/**"]},
@@ -672,15 +778,49 @@ mod scoped_tests {
         assert!(error.message.contains("ambiguous"));
 
         let empty = config(r#"[{"id":"empty","description":"Empty","files":["other/**"]}]"#);
-        let error = scoped_counts(
+        let scoped = scoped_counts(
             empty.rules.get("r").expect("rule"),
             &[counter::Measurement {
                 path: "src/a.java".into(),
                 value: 1,
             }],
         )
-        .expect_err("empty scope fails");
-        assert!(error.message.contains("selected no files"));
+        .expect("an empty scope is reported, not an error");
+        assert_eq!(
+            scoped.empty,
+            vec![("empty".to_string(), "Empty".to_string())]
+        );
+        assert!(
+            scoped
+                .entries
+                .iter()
+                .any(|(id, _, value)| id.is_none() && *value == 1),
+            "the global fallback still counts"
+        );
+    }
+
+    #[test]
+    fn ambiguity_is_decided_before_exclude() {
+        // Two scopes of equal specificity tie on the path; the `exclude`
+        // pattern would remove the measurement afterwards.  The assignment is
+        // decided first, so the tie still fails closed instead of being
+        // hidden by the exclusion.
+        let tied = config_with_exclude(
+            r#"[
+          {"id":"one","description":"One","files":["src/**"]},
+          {"id":"two","description":"Two","files":["src/**"]}
+        ]"#,
+            r#"["src/a.java"]"#,
+        );
+        let error = scoped_counts(
+            tied.rules.get("r").expect("rule"),
+            &[counter::Measurement {
+                path: "src/a.java".into(),
+                value: 1,
+            }],
+        )
+        .expect_err("an excluded path does not resolve an ambiguous scope");
+        assert_eq!(error.message, "ambiguous path scopes for src/a.java");
     }
 }
 
@@ -737,8 +877,28 @@ pub fn counts(config: &Config, root: &std::path::Path, rule_filter: Option<&str>
                     continue;
                 }
             };
-            report.executed = report.executed.saturating_sub(1) + scoped.len();
-            for (scope_id, description, count) in scoped {
+            // A dead `exclude` pattern is a note here too: `count` reports
+            // what it counted, and a pattern that never applied is worth
+            // naming (SPEC 5.2).
+            push_unmatched_excludes(&mut report, id, rule, &scoped.unmatched_excludes);
+            // `count` is not a gate: the tolerance of `check` has no meaning
+            // here, and an empty scope stays the error it has always been.
+            if let Some((scope_id, description)) = scoped.empty.first() {
+                push_counter_error(
+                    &mut report,
+                    id,
+                    rule,
+                    counter::CounterError::runtime(format!(
+                        "scope {scope_id} ({description}) selected no files"
+                    )),
+                );
+                // The counter ran and delivered its measurements; only the
+                // scope is empty, so its output explains nothing.
+                report.empty_scope_errors += 1;
+                continue;
+            }
+            report.executed = report.executed.saturating_sub(1) + scoped.entries.len();
+            for (scope_id, description, count) in scoped.entries {
                 report.rules.push(RuleResult {
                     id: id.clone(),
                     scope_id,
@@ -757,17 +917,19 @@ pub fn counts(config: &Config, root: &std::path::Path, rule_filter: Option<&str>
             }
             continue;
         }
-        let count = match counter::finalize(
+        let finalized = match counter::finalize(
             run.value,
             &rule.exclude_globs,
             &format!("rules.{id}.exclude"),
         ) {
-            Ok(count) => count,
+            Ok(finalized) => finalized,
             Err(error) => {
                 push_counter_error(&mut report, id, rule, error);
                 continue;
             }
         };
+        push_unmatched_excludes(&mut report, id, rule, &finalized.unmatched_excludes);
+        let count = finalized.count;
         report.debug.push(format!("counter {id}: count {count}"));
         report.rules.push(RuleResult {
             id: id.clone(),
@@ -789,11 +951,28 @@ pub fn counts(config: &Config, root: &std::path::Path, rule_filter: Option<&str>
     report
 }
 
+/// The scoped values of a per-file measurement rule.
+///
+/// `empty` names the configured scopes that no measurement reached: they are
+/// stale artifacts, reported as notes by default and as errors under `--strict`
+/// (SPEC 5.2).  They are not part of `entries`: a scope that selects nothing
+/// is never compared.  A scope whose files exist but are all removed by
+/// `exclude` is neither empty nor measured: it gets no entry and is not stale.
+#[derive(Debug)]
+pub(crate) struct ScopedCounts {
+    /// One entry per scope that selected files, plus the global fallback.
+    pub entries: Vec<(Option<String>, String, i64)>,
+    /// The configured scopes that selected no file: `(id, description)`.
+    pub empty: Vec<(String, String)>,
+    /// The indices of the `exclude` patterns that matched no measurement.
+    pub unmatched_excludes: Vec<usize>,
+}
+
 /// Splits measurements into the one effective scope for each path, then reduces each selection.
 pub(crate) fn scoped_counts(
     rule: &Rule,
     measurements: &[counter::Measurement],
-) -> Result<Vec<(Option<String>, String, i64)>, counter::CounterError> {
+) -> Result<ScopedCounts, counter::CounterError> {
     let aggregate = rule.aggregate.ok_or_else(|| {
         counter::CounterError::config("config error: per-file measurements require an aggregate")
     })?;
@@ -816,14 +995,11 @@ pub(crate) fn scoped_counts(
         }
         descriptions.insert(Some(scope.id.clone()), scope.description.clone());
     }
+    // The scopes are assigned **before** `exclude` decides whether a
+    // measurement contributes: a scope whose files still exist but are all
+    // excluded is not empty, it is simply not measured.
+    let mut matched_scopes = std::collections::BTreeSet::new();
     for measurement in measurements {
-        if rule
-            .exclude_globs
-            .iter()
-            .any(|glob| glob.is_match(&measurement.path))
-        {
-            continue;
-        }
         let exact: Vec<_> = rule
             .scopes
             .iter()
@@ -867,17 +1043,34 @@ pub(crate) fn scoped_counts(
             ranked.first().map(|(_, scope)| *scope)
         };
         let key = selected.map(|scope| scope.id.clone());
+        if let Some(scope_id) = &key {
+            matched_scopes.insert(scope_id.clone());
+        }
+        if rule
+            .exclude_globs
+            .iter()
+            .flatten()
+            .any(|glob| glob.is_match(&measurement.path))
+        {
+            continue;
+        }
         groups.entry(key).or_default().push(measurement.value);
     }
+    let unmatched_excludes = rule
+        .exclude_globs
+        .iter()
+        .enumerate()
+        .filter(|(_, group)| {
+            !group
+                .iter()
+                .any(|glob| measurements.iter().any(|m| glob.is_match(&m.path)))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let mut empty = Vec::new();
     for scope in &rule.scopes {
-        if groups
-            .get(&Some(scope.id.clone()))
-            .is_none_or(Vec::is_empty)
-        {
-            return Err(counter::CounterError::runtime(format!(
-                "scope {} ({}) selected no files",
-                scope.id, scope.description
-            )));
+        if !matched_scopes.contains(&scope.id) {
+            empty.push((scope.id.clone(), scope.description.clone()));
         }
     }
     if groups.is_empty() {
@@ -885,7 +1078,7 @@ pub(crate) fn scoped_counts(
             "the counter selected no files",
         ));
     }
-    let mut out = Vec::new();
+    let mut entries = Vec::new();
     for (id, values) in groups {
         if values.is_empty() {
             continue;
@@ -903,9 +1096,13 @@ pub(crate) fn scoped_counts(
             .and_then(|id| descriptions.get(&Some(id.clone())).cloned())
             .or_else(|| rule.description.clone())
             .unwrap_or_else(|| "Global fallback".to_string());
-        out.push((id, description, value));
+        entries.push((id, description, value));
     }
-    Ok(out)
+    Ok(ScopedCounts {
+        entries,
+        empty,
+        unmatched_excludes,
+    })
 }
 
 fn glob_specificity(patterns: &[String], path: &str) -> (usize, usize) {
@@ -989,6 +1186,10 @@ pub enum ActionKind {
     Updated,
     /// The baseline was not allowed to move.
     Refused,
+    /// A stale record was left untouched (the tolerant `baseline init`).
+    Ignored,
+    /// A stale record was removed (`baseline update`).
+    Pruned,
 }
 
 impl ActionKind {
@@ -999,6 +1200,8 @@ impl ActionKind {
             ActionKind::Kept => "kept",
             ActionKind::Updated => "updated",
             ActionKind::Refused => "refused",
+            ActionKind::Ignored => "ignored",
+            ActionKind::Pruned => "pruned",
         }
     }
 }

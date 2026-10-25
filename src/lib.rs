@@ -19,6 +19,7 @@ pub mod path;
 pub mod registry;
 pub mod release;
 pub mod report;
+pub mod stale;
 pub mod update;
 pub mod update_check;
 pub mod verify;
@@ -314,6 +315,7 @@ fn run_gates(cli: &Cli, context: &Context, run: &Run<'_>) -> Result<check::Repor
         tier: run.tier,
         paths: run.paths,
         ignore: &ignore,
+        strict: cli.strict,
     };
     let mut report = check::check(
         &context.config,
@@ -349,6 +351,7 @@ fn run_gates(cli: &Cli, context: &Context, run: &Run<'_>) -> Result<check::Repor
         .rules
         .iter()
         .any(|rule| rule.status == check::RuleStatus::CounterError)
+        && report.counter_errors > report.empty_scope_errors
     {
         report
             .notes
@@ -357,6 +360,7 @@ fn run_gates(cli: &Cli, context: &Context, run: &Run<'_>) -> Result<check::Repor
 
     report.ok = report.failed() == 0
         && report.counter_errors == 0
+        && report.stale_errors == 0
         && report.drifted() == 0
         && report.checks() > 0
         && tier_notes.is_empty();
@@ -436,8 +440,9 @@ fn cmd_report(cli: &Cli, args: &ReportArgs, cwd: &Path) -> Result<i32, Error> {
     check_for_a_new_version(cli);
 
     // The report was produced: the command succeeded.  The verdict of the
-    // run is in the report, not in the exit code.
-    Ok(0)
+    // run is in the report, not in the exit code — except under `--strict`,
+    // where stale artifacts are an operational error (SPEC 5.2).
+    Ok(if report.stale_errors > 0 { 2 } else { 0 })
 }
 
 /// Computes the next version and the changelog of the release (SPEC §16).
@@ -690,6 +695,7 @@ fn cmd_count(cli: &Cli, cwd: &Path) -> Result<i32, Error> {
         .rules
         .iter()
         .any(|rule| rule.status == check::RuleStatus::CounterError)
+        && report.counter_errors > report.empty_scope_errors
     {
         report
             .notes
@@ -709,6 +715,54 @@ fn cmd_count(cli: &Cli, cwd: &Path) -> Result<i32, Error> {
     }
 }
 
+/// The stale artifacts that a `baseline init --strict` refuses to document.
+///
+/// The pre-flight detects the baseline records the config no longer has and
+/// runs the counters of the per-file measurement rules: a configured scope
+/// that selects no files is only visible after the measurement ran
+/// (SPEC 5.4).  The successful runs are handed back so that the init does not
+/// count a rule twice.  A counter failure is an operational error: the
+/// baseline is not documented on a tree whose count is unknown.
+fn preflight_stale(
+    context: &Context,
+    baseline: &Baseline,
+    rule_filter: Option<&str>,
+    runs: &mut std::collections::BTreeMap<String, counter::CounterRun>,
+) -> Result<Vec<stale::Stale>, Error> {
+    let mut artifacts = Vec::new();
+    if rule_filter.is_none() {
+        artifacts.extend(stale::unknown_rules(&context.config, baseline));
+    }
+    for (id, rule) in &context.config.rules {
+        if rule_filter.is_some_and(|filter| filter != id) {
+            continue;
+        }
+        artifacts.extend(stale::unknown_scopes(rule, baseline));
+        if rule.scopes.is_empty() && rule.aggregate.is_none() {
+            continue;
+        }
+        let run = counter::run_counter(&rule.count, &context.root, &format!("rules.{id}.count"))
+            .map_err(|error| Error::new(error.message))?;
+        let measurements = run.value.measurements.as_ref().ok_or_else(|| {
+            Error::new(format!(
+                "config error: a rule with aggregate or scopes must emit per-file measurements \
+                 (rules.{id}.count)"
+            ))
+        })?;
+        let scoped =
+            check::scoped_counts(rule, measurements).map_err(|error| Error::new(error.message))?;
+        for (scope, description) in scoped.empty {
+            artifacts.push(stale::Stale::EmptyScope {
+                rule: id.clone(),
+                scope,
+                description,
+            });
+        }
+        runs.insert(id.clone(), run);
+    }
+    Ok(artifacts)
+}
+
 fn cmd_baseline(cli: &Cli, cwd: &Path, update: bool, reason: Option<&str>) -> Result<i32, Error> {
     let context = load_context(cli, cwd)?;
     let mut baseline = Baseline::load_if_exists(Some(&context.root), &context.baseline_path)?;
@@ -720,10 +774,96 @@ fn cmd_baseline(cli: &Cli, cwd: &Path, update: bool, reason: Option<&str>) -> Re
     let mut changed = false;
     let mut debug: Vec<String> = Vec::new();
 
+    // `baseline init --strict` validates before it writes: the baseline is
+    // only documented on a tree that carries no leftovers (SPEC 5.4).  The
+    // counters of the per-file measurement rules run once; a successful run
+    // is handed to the initialization below.
+    let mut preflight: std::collections::BTreeMap<String, counter::CounterRun> =
+        std::collections::BTreeMap::new();
+    if !update && cli.strict {
+        let artifacts = preflight_stale(&context, &baseline, cli.rule.as_deref(), &mut preflight)?;
+        if !artifacts.is_empty() {
+            let messages: Vec<String> = artifacts
+                .iter()
+                .map(|artifact| artifact.check_note(true))
+                .collect();
+            return Err(Error::new(messages.join("\n")));
+        }
+    }
+
+    // A baseline rule record for a rule the config no longer has is stale.
+    // The update prunes it; the init documents it and leaves it be; the
+    // strict init refused above.
+    if cli.rule.is_none() {
+        for artifact in stale::unknown_rules(&context.config, &baseline) {
+            let stale::Stale::UnknownRule { rule } = &artifact else {
+                continue;
+            };
+            if update {
+                baseline.rules.remove(rule);
+                changed = true;
+                actions.push(BaselineAction {
+                    id: rule.clone(),
+                    kind: ActionKind::Pruned,
+                    value: None,
+                    message: artifact.update_pruned(),
+                });
+            } else if !cli.strict {
+                actions.push(BaselineAction {
+                    id: rule.clone(),
+                    kind: ActionKind::Ignored,
+                    value: None,
+                    message: artifact.init_ignored(),
+                });
+            }
+        }
+    }
+
     for (id, rule) in &context.config.rules {
         if let Some(filter) = &cli.rule {
             if filter != id {
                 continue;
+            }
+        }
+
+        // A baseline scope record for a scope this rule no longer configures
+        // is stale.  It is config-level: it is pruned (or ignored) even when
+        // the counter fails below.
+        let unknown_scopes = stale::unknown_scopes(rule, &baseline);
+        if update {
+            for artifact in unknown_scopes {
+                let stale::Stale::UnknownScope { scope, .. } = &artifact else {
+                    continue;
+                };
+                let removed = baseline
+                    .rules
+                    .get_mut(id)
+                    .and_then(|record| record.scopes.remove(scope));
+                if let Some(record) = removed {
+                    changed = true;
+                    actions.push(BaselineAction {
+                        id: artifact.action_id(),
+                        kind: ActionKind::Pruned,
+                        value: Some(record.value),
+                        message: artifact.update_pruned(),
+                    });
+                }
+            }
+        } else if !cli.strict {
+            for artifact in unknown_scopes {
+                let value = match &artifact {
+                    stale::Stale::UnknownScope { scope, .. } => baseline
+                        .get(id)
+                        .and_then(|record| record.scopes.get(scope))
+                        .map(|record| record.value),
+                    _ => None,
+                };
+                actions.push(BaselineAction {
+                    id: artifact.action_id(),
+                    kind: ActionKind::Ignored,
+                    value,
+                    message: artifact.init_ignored(),
+                });
             }
         }
 
@@ -745,24 +885,27 @@ fn cmd_baseline(cli: &Cli, cwd: &Path, update: bool, reason: Option<&str>) -> Re
         }
 
         let counter_path = format!("rules.{id}.count");
-        let run = match counter::run_counter(&rule.count, &context.root, &counter_path) {
-            Ok(run) => run,
-            Err(error) => {
-                counter_errors += 1;
-                failed += 1;
-                debug.push(format!(
-                    "counter {id}: {}\n{}",
-                    rule.count.describe(),
-                    error.output.clone().unwrap_or_default()
-                ));
-                actions.push(BaselineAction {
-                    id: id.clone(),
-                    kind: ActionKind::Refused,
-                    value: None,
-                    message: error.message.clone(),
-                });
-                continue;
-            }
+        let run = match preflight.remove(id) {
+            Some(run) => run,
+            None => match counter::run_counter(&rule.count, &context.root, &counter_path) {
+                Ok(run) => run,
+                Err(error) => {
+                    counter_errors += 1;
+                    failed += 1;
+                    debug.push(format!(
+                        "counter {id}: {}\n{}",
+                        rule.count.describe(),
+                        error.output.clone().unwrap_or_default()
+                    ));
+                    actions.push(BaselineAction {
+                        id: id.clone(),
+                        kind: ActionKind::Refused,
+                        value: None,
+                        message: error.message.clone(),
+                    });
+                    continue;
+                }
+            },
         };
         debug.push(format!(
             "counter {id}: {}\n{}\n--- count ---",
@@ -784,7 +927,40 @@ fn cmd_baseline(cli: &Cli, cwd: &Path, update: bool, reason: Option<&str>) -> Re
                     continue;
                 }
             };
+            // A configured scope that selects no file is stale: the update
+            // prunes its record and never pays it down; the init writes no
+            // record for it (SPEC 5.5, 5.4).
+            for (scope_id, description) in &scoped.empty {
+                let artifact = stale::Stale::EmptyScope {
+                    rule: id.clone(),
+                    scope: scope_id.clone(),
+                    description: description.clone(),
+                };
+                if update {
+                    let removed = baseline
+                        .rules
+                        .get_mut(id)
+                        .and_then(|record| record.scopes.remove(scope_id));
+                    if let Some(record) = removed {
+                        changed = true;
+                        actions.push(BaselineAction {
+                            id: artifact.action_id(),
+                            kind: ActionKind::Pruned,
+                            value: Some(record.value),
+                            message: artifact.update_pruned(),
+                        });
+                    }
+                } else {
+                    actions.push(BaselineAction {
+                        id: artifact.action_id(),
+                        kind: ActionKind::Ignored,
+                        value: None,
+                        message: artifact.init_ignored(),
+                    });
+                }
+            }
             let global_value = scoped
+                .entries
                 .iter()
                 .find(|(scope, _, _)| scope.is_none())
                 .map(|(_, _, value)| *value);
@@ -799,7 +975,7 @@ fn cmd_baseline(cli: &Cli, cwd: &Path, update: bool, reason: Option<&str>) -> Re
                 );
                 changed = true;
             }
-            for (scope_id, description, value) in scoped {
+            for (scope_id, description, value) in scoped.entries {
                 if let Some(scope_id) = scope_id {
                     let current = baseline
                         .get(id)
@@ -929,7 +1105,7 @@ fn cmd_baseline(cli: &Cli, cwd: &Path, update: bool, reason: Option<&str>) -> Re
             &rule.exclude_globs,
             &format!("rules.{id}.exclude"),
         ) {
-            Ok(count) => count,
+            Ok(finalized) => finalized.count,
             Err(error) => {
                 counter_errors += 1;
                 failed += 1;
@@ -1564,9 +1740,10 @@ fn print_notes(notes: &[String], debug: &[String], cli: &Cli) {
     }
 }
 
-/// The exit code of a check: 2 for a counter error, 1 for a failed gate.
+/// The exit code of a check: 2 for a counter error or a stale artifact under
+/// `--strict`, 1 for a failed gate.
 fn exit_code(report: &Report) -> i32 {
-    if report.counter_errors > 0 {
+    if report.counter_errors > 0 || report.stale_errors > 0 {
         2
     } else if report.ok {
         0
@@ -1710,6 +1887,10 @@ struct Cli {
     /// Only print failures.
     #[arg(long, global = true, short = 'q')]
     quiet: bool,
+
+    /// Fail closed on stale baseline records and scopes that select no files.
+    #[arg(long, global = true)]
+    strict: bool,
 
     /// Do not check for a new version.
     #[arg(long, global = true)]

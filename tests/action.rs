@@ -699,6 +699,13 @@ fn run_update(project: &TempDir, config: &str, reason: &str) -> Output {
         .env("RATCHET_NO_UPDATE_CHECK", "1")
         .env("RATCHET_CONFIG", config)
         .env("RATCHET_REASON", reason)
+        // The action sets the identity of the commit itself (`-c user.name`).
+        // An ambient Git identity would override it, and the test would read
+        // the identity of the machine instead of the action's.
+        .env_remove("GIT_AUTHOR_NAME")
+        .env_remove("GIT_AUTHOR_EMAIL")
+        .env_remove("GIT_COMMITTER_NAME")
+        .env_remove("GIT_COMMITTER_EMAIL")
         .output()
         .expect("the update script runs")
 }

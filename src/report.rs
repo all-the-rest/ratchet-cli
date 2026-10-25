@@ -89,8 +89,16 @@ pub fn render_stylish(report: &Report, quiet: bool) -> String {
                 report.gates()
             ));
         } else {
+            // The operational errors are not gates: a stale artifact makes the
+            // run NOT COHERENT (exit 2) without failing a gate, and the
+            // headline has to say why (SPEC 5.2, 6.1).
+            let stale = if report.stale_errors == 0 {
+                String::new()
+            } else {
+                format!(", {}", plural(report.stale_errors, "stale artifact"))
+            };
             out.push_str(&format!(
-                "NOT COHERENT — {} of {} gates failed\n",
+                "NOT COHERENT — {} of {} gates failed{stale}\n",
                 failed + drifted,
                 report.gates()
             ));

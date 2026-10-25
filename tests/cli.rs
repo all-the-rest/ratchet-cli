@@ -7904,3 +7904,985 @@ fn a_directory_of_the_generated_file_that_cannot_be_created_is_an_error() {
     // The generator is not the one that is blamed.
     assert!(!text.contains("exited with status"), "{text}");
 }
+
+/// A scoped per-file rule: `metric` measures every Java file, scope `auth`.
+const STALE_SCOPED_CONFIG: &str = r#"{
+  "rules": {
+    "metric": {
+      "class": "file growth", "incident": "test", "unit": "bytes",
+      "direction": "ceiling", "description": "All Java sources", "aggregate": "max",
+      "count": {"file_metrics": {"files": ["**/*.java"], "metric": "size_bytes"}},
+      "scopes": [{"id": "auth", "description": "Auth", "files": ["src/auth/**"]}]
+    }
+  }
+}"#;
+
+/// `STALE_SCOPED_CONFIG` plus a scope whose file does not exist.
+const EMPTY_SCOPE_CONFIG: &str = r#"{
+  "rules": {
+    "metric": {
+      "class": "file growth", "incident": "test", "unit": "bytes",
+      "direction": "ceiling", "description": "All Java sources", "aggregate": "max",
+      "count": {"file_metrics": {"files": ["**/*.java"], "metric": "size_bytes"}},
+      "scopes": [
+        {"id": "auth", "description": "Auth", "files": ["src/auth/**"]},
+        {"id": "legacy", "description": "Legacy", "files": ["src/legacy/**"]}
+      ]
+    }
+  }
+}"#;
+
+/// A baseline with a removed rule and a removed scope next to a live one.
+const STALE_BASELINE: &str = r#"{
+  "version": 1,
+  "rules": {
+    "removed": {"value": 1},
+    "metric": {
+      "value": 6,
+      "scopes": {
+        "auth": {"value": 3},
+        "gone": {"value": 9}
+      }
+    }
+  }
+}"#;
+
+/// Writes the two Java files `STALE_SCOPED_CONFIG` measures (3 and 6 bytes).
+fn write_stale_java(repo: &Repo) {
+    repo.write("src/auth/Login.java", "abc");
+    repo.write("src/Other.java", "123456");
+}
+
+#[test]
+fn stale_artifacts_are_notes_by_default_and_check_never_prunes() {
+    let repo = Repo::plain(STALE_SCOPED_CONFIG, Some(STALE_BASELINE));
+    write_stale_java(&repo);
+    let before = repo.read("ratchet.baseline.json");
+
+    let output = repo.run(&["check"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let notes = stderr(&output);
+    assert!(
+        notes.contains("baseline record for unknown rule \"removed\""),
+        "{notes}"
+    );
+    assert!(
+        notes.contains("baseline scope \"gone\" for rule \"metric\" is not configured"),
+        "{notes}"
+    );
+    assert!(notes.contains("ignored"), "{notes}");
+    assert!(stdout(&output).contains("COHERENT"), "{}", stdout(&output));
+    assert_eq!(
+        repo.read("ratchet.baseline.json"),
+        before,
+        "a check never prunes"
+    );
+}
+
+#[test]
+fn check_strict_fails_on_every_stale_artifact_and_report_strict_exits_two() {
+    let repo = Repo::plain(STALE_SCOPED_CONFIG, Some(STALE_BASELINE));
+    write_stale_java(&repo);
+
+    let output = repo.run(&["check", "--strict", "--format", "json"]);
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    let report: Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    assert_eq!(report["ok"], false);
+    let notes: Vec<&str> = report["notes"]
+        .as_array()
+        .expect("notes")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let notes = notes.join("\n");
+    assert!(
+        notes.contains(
+            "baseline record for unknown rule \"removed\" — remove it or run ratchet baseline update"
+        ),
+        "{notes}"
+    );
+    assert!(
+        notes.contains(
+            "baseline scope \"gone\" for rule \"metric\" is not configured — remove it or run \
+             ratchet baseline update"
+        ),
+        "{notes}"
+    );
+
+    let repeated = repo.run(&["check", "--strict", "--format", "json"]);
+    assert_eq!(
+        output.stdout, repeated.stdout,
+        "strict reports are deterministic"
+    );
+
+    let markdown = repo.run(&["report", "--strict"]);
+    assert_eq!(code(&markdown), 2, "{}", stderr(&markdown));
+    let text = stdout(&markdown);
+    assert!(text.contains("NOT COHERENT"), "{text}");
+    assert!(text.contains("unknown rule \"removed\""), "{text}");
+}
+
+#[test]
+fn an_empty_configured_scope_is_skipped_by_default_and_fails_under_strict() {
+    let repo = Repo::plain(EMPTY_SCOPE_CONFIG, Some(STALE_BASELINE));
+    write_stale_java(&repo);
+
+    let output = repo.run(&["check", "--format", "json"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(
+            "rule metric scope legacy selects no files — ignored (remove the scope from the config)"
+        ),
+        "{}",
+        stderr(&output)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    let rules = report["rules"].as_array().expect("rules");
+    // The empty scope contributes no result; the global fallback is compared.
+    assert!(
+        rules.iter().all(|rule| rule["scope"] != "legacy"),
+        "{rules:?}"
+    );
+    assert!(
+        rules
+            .iter()
+            .any(|rule| rule["scope"].is_null() && rule["count"] == 6 && rule["baseline"] == 6),
+        "the global fallback still runs: {rules:?}"
+    );
+
+    let strict = repo.run(&["check", "--strict"]);
+    assert_eq!(code(&strict), 2, "{}", stderr(&strict));
+    assert!(
+        stdout(&strict).contains("scope legacy (Legacy) selected no files"),
+        "{}",
+        stdout(&strict)
+    );
+}
+
+#[test]
+fn a_strict_empty_scope_does_not_get_the_counter_debug_hint() {
+    let repo = Repo::plain(EMPTY_SCOPE_CONFIG, Some(STALE_BASELINE));
+    write_stale_java(&repo);
+
+    // The counter ran and delivered its measurements; only the configured
+    // scope is empty, so its output cannot explain the result.
+    let empty = repo.run(&["check", "--strict"]);
+    assert_eq!(code(&empty), 2, "{}", stderr(&empty));
+    assert!(
+        !stderr(&empty).contains("hint: run with --debug to see the output of the counter"),
+        "{}",
+        stderr(&empty)
+    );
+
+    // A genuine counter failure still gets the hint.
+    let broken = r#"{
+      "rules": {
+        "broken": {
+          "class": "unfinished work", "incident": "test", "unit": "files",
+          "direction": "ceiling",
+          "count": {"command": ["echo", "not a count"]}
+        }
+      }
+    }"#;
+    let broken_repo = Repo::plain(broken, Some(&baseline("broken", 1)));
+    let failed = broken_repo.run(&["check"]);
+    assert_eq!(code(&failed), 2, "{}", stderr(&failed));
+    assert!(
+        stderr(&failed).contains("hint: run with --debug to see the output of the counter"),
+        "{}",
+        stderr(&failed)
+    );
+}
+
+#[test]
+fn a_count_empty_scope_does_not_get_the_counter_debug_hint() {
+    let repo = Repo::plain(EMPTY_SCOPE_CONFIG, Some(STALE_BASELINE));
+    write_stale_java(&repo);
+
+    // The counter ran and delivered its measurements; only the configured
+    // scope is empty, so its output cannot explain the result.  `count` still
+    // fails closed.
+    let empty = repo.run(&["count"]);
+    assert_eq!(code(&empty), 2, "{}", stderr(&empty));
+    assert!(
+        stdout(&empty).contains("scope legacy (Legacy) selected no files"),
+        "{}",
+        stdout(&empty)
+    );
+    assert!(
+        !stderr(&empty).contains("hint: run with --debug to see the output of the counter"),
+        "{}",
+        stderr(&empty)
+    );
+
+    // A genuine counter failure still gets the hint.
+    let broken = r#"{
+      "rules": {
+        "broken": {
+          "class": "unfinished work", "incident": "test", "unit": "files",
+          "direction": "ceiling",
+          "count": {"command": ["echo", "not a count"]}
+        }
+      }
+    }"#;
+    let broken_repo = Repo::plain(broken, Some(&baseline("broken", 1)));
+    let failed = broken_repo.run(&["count"]);
+    assert_eq!(code(&failed), 2, "{}", stderr(&failed));
+    assert!(
+        stderr(&failed).contains("hint: run with --debug to see the output of the counter"),
+        "{}",
+        stderr(&failed)
+    );
+}
+
+#[test]
+fn baseline_init_documents_a_tree_with_stale_records() {
+    let repo = Repo::plain(ceiling_config(), Some(&baseline("removed", 5)));
+
+    let output = repo.run(&["baseline", "init"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("left untouched (run ratchet baseline update to prune)"),
+        "{}",
+        stdout(&output)
+    );
+    let written: Value =
+        serde_json::from_str(&repo.read("ratchet.baseline.json")).expect("baseline JSON");
+    assert_eq!(
+        written["rules"]["removed"]["value"], 5,
+        "the stale record stays"
+    );
+    assert_eq!(
+        written["rules"]["todo-markers"]["value"], 3,
+        "the missing baseline is written"
+    );
+}
+
+#[test]
+fn baseline_init_strict_refuses_without_writing() {
+    let stale = baseline("removed", 5);
+    let repo = Repo::plain(ceiling_config(), Some(&stale));
+
+    let output = repo.run(&["baseline", "init", "--strict"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("baseline record for unknown rule \"removed\""),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("remove it or run ratchet baseline update"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        repo.read("ratchet.baseline.json"),
+        stale,
+        "a failed strict init writes nothing"
+    );
+}
+
+#[test]
+fn baseline_init_strict_writes_when_nothing_is_stale() {
+    let repo = Repo::plain(ceiling_config(), None);
+
+    let output = repo.run(&["baseline", "init", "--strict"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let written: Value =
+        serde_json::from_str(&repo.read("ratchet.baseline.json")).expect("baseline JSON");
+    assert_eq!(written["rules"]["todo-markers"]["value"], 3);
+}
+
+#[test]
+fn baseline_update_prunes_rule_and_scope_records_and_leaves_a_green_strict_check() {
+    let config = r#"{
+      "rules": {
+        "metric": {
+          "class": "file growth", "incident": "test", "unit": "bytes",
+          "direction": "ceiling", "description": "All Java sources", "aggregate": "max",
+          "count": {"file_metrics": {"files": ["**/*.java"], "metric": "size_bytes"}},
+          "scopes": [
+            {"id": "auth", "description": "Auth", "files": ["src/auth/**"]},
+            {"id": "legacy", "description": "Legacy", "files": ["src/legacy/**"]}
+          ]
+        }
+      }
+    }"#;
+    let before = r#"{
+      "version": 1,
+      "rules": {
+        "removed": {"value": 1},
+        "metric": {
+          "value": 4,
+          "scopes": {
+            "auth": {"value": 3},
+            "gone": {"value": 9},
+            "legacy": {"value": 7}
+          }
+        }
+      }
+    }"#;
+    let repo = Repo::plain(config, Some(before));
+    repo.write("src/auth/Login.java", "abc");
+    repo.write("src/Other.java", "1234");
+
+    let output = repo.run(&["baseline", "update"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("rule \"removed\" is no longer configured — pruned"),
+        "{text}"
+    );
+    assert!(
+        text.contains("scope \"gone\" is no longer configured — pruned"),
+        "{text}"
+    );
+    assert!(
+        text.contains("scope \"legacy\" selects no files — pruned"),
+        "{text}"
+    );
+    let written: Value =
+        serde_json::from_str(&repo.read("ratchet.baseline.json")).expect("baseline JSON");
+    assert!(written["rules"].get("removed").is_none(), "{written}");
+    assert!(written["rules"]["metric"]["scopes"].get("gone").is_none());
+    assert!(written["rules"]["metric"]["scopes"].get("legacy").is_none());
+    assert_eq!(written["rules"]["metric"]["scopes"]["auth"]["value"], 3);
+    assert_eq!(written["rules"]["metric"]["value"], 4);
+
+    // The engine never mutates the config: the project drops the scope that
+    // no longer selects a file.  The record is already pruned, so the run is
+    // green and nothing stale is left.
+    let cleaned = config.replace(
+        r#",
+            {"id": "legacy", "description": "Legacy", "files": ["src/legacy/**"]}"#,
+        "",
+    );
+    repo.write("ratchet.config.jsonc", &cleaned);
+    let check = repo.run(&["check", "--strict"]);
+    assert_eq!(code(&check), 0, "{}", stderr(&check));
+    let notes = stderr(&check);
+    assert!(!notes.contains("unknown rule"), "{notes}");
+    assert!(!notes.contains("is not configured"), "{notes}");
+    assert!(!notes.contains("selects no files"), "{notes}");
+}
+
+#[test]
+fn a_reintroduced_scope_gets_the_fresh_value_after_a_prune() {
+    let config = r#"{
+      "rules": {
+        "metric": {
+          "class": "file growth", "incident": "test", "unit": "bytes",
+          "direction": "ceiling", "description": "All Java sources", "aggregate": "max",
+          "count": {"file_metrics": {"files": ["**/*.java"], "metric": "size_bytes"}},
+          "scopes": [{"id": "legacy", "description": "Legacy", "files": ["src/legacy/**"]}]
+        }
+      }
+    }"#;
+    let before = r#"{
+      "version": 1,
+      "rules": {
+        "metric": {
+          "value": 4,
+          "scopes": {"legacy": {"value": 7}}
+        }
+      }
+    }"#;
+    let repo = Repo::plain(config, Some(before));
+    repo.write("src/Other.java", "1234");
+    // The scope selects nothing: the old record is stale.
+    let pruned = repo.run(&["baseline", "update"]);
+    assert_eq!(code(&pruned), 0, "{}", stderr(&pruned));
+    assert!(!repo.read("ratchet.baseline.json").contains("\"legacy\""));
+
+    // The scope comes back with a file: the fresh value is 5, not the old 7.
+    repo.write("src/legacy/Old.java", "12345");
+    let initialized = repo.run(&["baseline", "init"]);
+    assert_eq!(code(&initialized), 0, "{}", stderr(&initialized));
+    let written: Value =
+        serde_json::from_str(&repo.read("ratchet.baseline.json")).expect("baseline JSON");
+    assert_eq!(written["rules"]["metric"]["scopes"]["legacy"]["value"], 5);
+}
+
+#[test]
+fn strict_is_accepted_by_count_and_baseline_update() {
+    let count_repo = Repo::plain(ceiling_config(), Some(&baseline("todo-markers", 5)));
+    let counted = count_repo.run(&["count", "--strict"]);
+    assert_eq!(code(&counted), 0, "{}", stderr(&counted));
+
+    // The update stays the cleanup step: `--strict` is a no-op there.
+    let update_repo = Repo::plain(
+        ceiling_config(),
+        Some(&baseline_with_unknown_rule("todo-markers", 3, "removed")),
+    );
+    let updated = update_repo.run(&["baseline", "update", "--strict"]);
+    assert_eq!(code(&updated), 0, "{}", stderr(&updated));
+    let written: Value =
+        serde_json::from_str(&update_repo.read("ratchet.baseline.json")).expect("baseline JSON");
+    assert!(written["rules"].get("removed").is_none());
+    assert_eq!(written["rules"]["todo-markers"]["value"], 3);
+}
+
+#[test]
+fn a_tolerance_only_run_with_zero_executed_checks_still_fails() {
+    let config = r#"{
+      "rules": {
+        "docs": {
+          "class": "documentation", "incident": "test", "unit": "files",
+          "direction": "ceiling", "files": ["docs/**"],
+          "count": {"command": ["echo", "1"]}
+        }
+      }
+    }"#;
+    let before = baseline_with_unknown_rule("docs", 1, "removed");
+    let repo = Repo::plain(config, Some(&before));
+    repo.write("src/main.rs", "fn main() {}\n");
+
+    let output = repo.run(&["check", "src/main.rs"]);
+
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("an empty selection is never a pass"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("baseline record for unknown rule \"removed\""),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(repo.read("ratchet.baseline.json"), before);
+}
+
+/// A baseline with one live and one unknown rule record.
+fn baseline_with_unknown_rule(rule: &str, value: i64, unknown: &str) -> String {
+    format!(
+        "{{\n  \"version\": 1,\n  \"rules\": {{\n    \"{rule}\": {{ \"value\": {value} }},\n    \"{unknown}\": {{ \"value\": 1 }}\n  }}\n}}\n"
+    )
+}
+
+#[test]
+fn a_failed_strict_init_creates_no_baseline_directory() {
+    let config = r#"{
+      "baseline": "data/ratchet.baseline.json",
+      "rules": {
+        "metric": {
+          "class": "file growth", "incident": "test", "unit": "bytes",
+          "direction": "ceiling", "description": "All Java sources", "aggregate": "max",
+          "count": {"file_metrics": {"files": ["src/**/*.java"], "metric": "size_bytes"}},
+          "scopes": [{"id": "gone", "description": "Gone", "files": ["src/gone/**"]}]
+        }
+      }
+    }"#;
+    let repo = Repo::plain(config, None);
+    repo.write("src/A.java", "abc");
+
+    let output = repo.run(&["baseline", "init", "--strict"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("scope gone (Gone) selected no files"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        !repo.path().join("data").exists(),
+        "a failed strict init creates nothing"
+    );
+}
+
+/// An item counter with a dead `exclude` pattern among expansions: note,
+/// never an error, and the note names the dead pattern.
+#[test]
+fn a_dead_exclude_pattern_is_a_note_in_every_mode() {
+    let config = r#"{
+      "rules": {
+        "items": {
+          "class": "unfinished work", "incident": "test", "unit": "files",
+          "direction": "ceiling",
+          "exclude": ["a/**", "b/**", "dead/**"],
+          "count": {"command": ["echo", "[\"a/one.rs\",\"b/two.rs\"]"]}
+        }
+      }
+    }"#;
+    let repo = Repo::plain(config, Some(&baseline("items", 0)));
+
+    let output = repo.run(&["check"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let notes = stderr(&output);
+    assert_eq!(
+        notes
+            .lines()
+            .filter(|line| line.contains("matches nothing"))
+            .count(),
+        1,
+        "exactly one dead pattern: {notes}"
+    );
+    assert!(
+        notes.contains("exclude pattern \"dead/**\" for rule \"items\" matches nothing — ignored"),
+        "{notes}"
+    );
+    assert!(
+        !notes.contains("exclude pattern \"a/**\"") && !notes.contains("exclude pattern \"b/**\""),
+        "the expanded patterns matched: {notes}"
+    );
+
+    let strict = repo.run(&["check", "--strict"]);
+    assert_eq!(code(&strict), 0, "{}", stderr(&strict));
+    assert!(
+        stderr(&strict)
+            .contains("exclude pattern \"dead/**\" for rule \"items\" matches nothing — ignored"),
+        "{}",
+        stderr(&strict)
+    );
+
+    // A pattern that matches an item is not a note.
+    let matching = config.replace("\"dead/**\"", "\"a/**\"");
+    let matching_repo = Repo::plain(&matching, Some(&baseline("items", 0)));
+    let matched = matching_repo.run(&["check", "--strict"]);
+    assert_eq!(code(&matched), 0, "{}", stderr(&matched));
+    assert!(
+        !stderr(&matched).contains("matches nothing"),
+        "{}",
+        stderr(&matched)
+    );
+}
+
+/// The same dead-pattern note for the per-file measurement path.
+#[test]
+fn a_dead_exclude_pattern_on_measurements_names_the_dead_pattern() {
+    let config = r#"{
+      "rules": {
+        "metric": {
+          "class": "file growth", "incident": "test", "unit": "bytes",
+          "direction": "ceiling", "description": "Measured files", "aggregate": "max",
+          "exclude": ["src/a/**", "src/b/**", "vendor/**"],
+          "count": {"file_metrics": {"files": ["**/*.java"], "metric": "size_bytes"}}
+        }
+      }
+    }"#;
+    let repo = Repo::plain(config, Some(&baseline("metric", 6)));
+    repo.write("src/a/A.java", "a");
+    repo.write("src/b/B.java", "bb");
+    repo.write("src/Other.java", "123456");
+
+    let output = repo.run(&["check"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let notes = stderr(&output);
+    assert_eq!(
+        notes
+            .lines()
+            .filter(|line| line.contains("matches nothing"))
+            .count(),
+        1,
+        "exactly one dead pattern: {notes}"
+    );
+    assert!(
+        notes.contains(
+            "exclude pattern \"vendor/**\" for rule \"metric\" matches nothing — ignored"
+        ),
+        "{notes}"
+    );
+    assert!(
+        !notes.contains("exclude pattern \"src/a/**\"")
+            && !notes.contains("exclude pattern \"src/b/**\""),
+        "the expanded patterns matched: {notes}"
+    );
+
+    let strict = repo.run(&["check", "--strict"]);
+    assert_eq!(code(&strict), 0, "{}", stderr(&strict));
+    assert!(
+        stderr(&strict).contains(
+            "exclude pattern \"vendor/**\" for rule \"metric\" matches nothing — ignored"
+        ),
+        "{}",
+        stderr(&strict)
+    );
+}
+
+/// A per-file rule: `files` are measured, one scope.
+fn scoped_metric_rule(
+    files: &str,
+    scope_id: &str,
+    scope_files: &str,
+    tier: Option<&str>,
+) -> String {
+    let tier = tier
+        .map(|tier| format!("\"tier\": \"{tier}\","))
+        .unwrap_or_default();
+    format!(
+        r#"{{"class": "file growth", "incident": "test", "unit": "bytes",
+            {tier}
+            "direction": "ceiling", "description": "Measured files", "aggregate": "max",
+            "count": {{"file_metrics": {{"files": ["{files}"], "metric": "size_bytes"}}}},
+            "scopes": [{{"id": "{scope_id}", "description": "{scope_id}", "files": ["{scope_files}"]}}]}}"#
+    )
+}
+
+#[test]
+fn baseline_update_with_a_rule_prunes_only_that_rules_records() {
+    let config = format!(
+        r#"{{"rules": {{"metric": {}, "other": {}}}}}"#,
+        scoped_metric_rule("src/auth/**", "auth", "src/auth/**", None),
+        scoped_metric_rule("src/other/**", "live", "src/other/**", None),
+    );
+    let before = r#"{
+      "version": 1,
+      "rules": {
+        "removed": {"value": 1},
+        "metric": {
+          "value": 1,
+          "scopes": {"auth": {"value": 3}, "gone": {"value": 9}}
+        },
+        "other": {
+          "value": 1,
+          "scopes": {"live": {"value": 5}, "stale2": {"value": 9}}
+        }
+      }
+    }"#;
+    let repo = Repo::plain(&config, Some(before));
+    repo.write("src/auth/Login.java", "abc");
+    repo.write("src/other/Other.java", "abc");
+
+    let output = repo.run(&["baseline", "update", "--rule", "metric"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("scope \"gone\" is no longer configured — pruned"),
+        "{text}"
+    );
+    assert!(!text.contains("stale2"), "{text}");
+    assert!(!text.contains("rule \"removed\""), "{text}");
+    let written: Value =
+        serde_json::from_str(&repo.read("ratchet.baseline.json")).expect("baseline JSON");
+    assert!(written["rules"].get("removed").is_some(), "{written}");
+    assert!(
+        written["rules"]["metric"]["scopes"].get("gone").is_none(),
+        "{written}"
+    );
+    assert_eq!(written["rules"]["metric"]["scopes"]["auth"]["value"], 3);
+    assert_eq!(written["rules"]["other"]["scopes"]["stale2"]["value"], 9);
+    assert_eq!(written["rules"]["other"]["scopes"]["live"]["value"], 5);
+}
+
+#[test]
+fn strict_isolation_ignores_stale_artifacts_outside_the_selection() {
+    // `--rule` ignores another rule's stale scope.
+    let rule_config = r#"{
+      "rules": {
+        "metric": {
+          "class": "unfinished work", "incident": "test", "unit": "markers",
+          "direction": "ceiling", "count": {"command": ["echo", "3"]}
+        },
+        "other": {
+          "class": "unfinished work", "incident": "test", "unit": "markers",
+          "direction": "ceiling", "count": {"command": ["echo", "3"]}
+        }
+      }
+    }"#;
+    let rule_baseline = r#"{
+      "version": 1,
+      "rules": {
+        "metric": {"value": 3},
+        "other": {"value": 3, "scopes": {"stale": {"value": 9}}}
+      }
+    }"#;
+    let by_rule = Repo::plain(rule_config, Some(rule_baseline));
+    let rule_run = by_rule.run(&["check", "--strict", "--rule", "metric"]);
+    assert_eq!(code(&rule_run), 0, "{}", stderr(&rule_run));
+    assert!(
+        !stderr(&rule_run).contains("stale"),
+        "{}",
+        stderr(&rule_run)
+    );
+
+    // `--tier slow` ignores a fast rule's stale scope.
+    let tier_config = format!(
+        r#"{{"rules": {{"metric": {}, "slow": {}}}}}"#,
+        scoped_metric_rule("src/auth/**", "auth", "src/auth/**", Some("fast")),
+        scoped_metric_rule("src/slow/**", "slow", "src/slow/**", Some("slow")),
+    );
+    let tier_baseline = r#"{
+      "version": 1,
+      "rules": {
+        "metric": {
+          "value": 3,
+          "scopes": {"auth": {"value": 3}, "stale": {"value": 9}}
+        },
+        "slow": {"value": 3, "scopes": {"slow": {"value": 3}}}
+      }
+    }"#;
+    let by_tier = Repo::plain(&tier_config, Some(tier_baseline));
+    by_tier.write("src/auth/Login.java", "abc");
+    by_tier.write("src/slow/Slow.java", "abc");
+    let tier_run = by_tier.run(&["check", "--strict", "--tier", "slow"]);
+    assert_eq!(code(&tier_run), 0, "{}", stderr(&tier_run));
+    assert!(
+        !stderr(&tier_run).contains("stale"),
+        "{}",
+        stderr(&tier_run)
+    );
+
+    // A path selection ignores a rule whose scope does not intersect it.
+    let path_config = r#"{
+      "rules": {
+        "metric": {
+          "class": "unfinished work", "incident": "test", "unit": "markers",
+          "direction": "ceiling", "files": ["src/auth/**"],
+          "count": {"command": ["echo", "3"]}
+        },
+        "other": {
+          "class": "unfinished work", "incident": "test", "unit": "markers",
+          "direction": "ceiling", "files": ["src/other/**"],
+          "count": {"command": ["echo", "3"]}
+        }
+      }
+    }"#;
+    let path_baseline = r#"{
+      "version": 1,
+      "rules": {
+        "metric": {"value": 3},
+        "other": {"value": 3, "scopes": {"stale": {"value": 9}}}
+      }
+    }"#;
+    let by_path = Repo::plain(path_config, Some(path_baseline));
+    by_path.write("src/auth/Login.java", "abc");
+    let path_run = by_path.run(&["check", "--strict", "src/auth/Login.java"]);
+    assert_eq!(code(&path_run), 0, "{}", stderr(&path_run));
+    assert!(
+        !stderr(&path_run).contains("stale"),
+        "{}",
+        stderr(&path_run)
+    );
+}
+
+#[test]
+fn baseline_init_strict_refuses_on_an_unknown_scope_record() {
+    let before = r#"{
+      "version": 1,
+      "rules": {
+        "metric": {
+          "value": 6,
+          "scopes": {"auth": {"value": 3}, "gone": {"value": 9}}
+        }
+      }
+    }"#;
+    let repo = Repo::plain(STALE_SCOPED_CONFIG, Some(before));
+    write_stale_java(&repo);
+
+    let output = repo.run(&["baseline", "init", "--strict"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("baseline scope \"gone\" for rule \"metric\" is not configured"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        repo.read("ratchet.baseline.json"),
+        before,
+        "a failed strict init writes nothing"
+    );
+}
+
+#[test]
+fn default_baseline_init_reports_stale_scopes_as_ignored_actions() {
+    let before = r#"{
+      "version": 1,
+      "rules": {
+        "metric": {
+          "value": 6,
+          "scopes": {"auth": {"value": 3}, "gone": {"value": 9}}
+        }
+      }
+    }"#;
+    let repo = Repo::plain(EMPTY_SCOPE_CONFIG, Some(before));
+    write_stale_java(&repo);
+
+    let output = repo.run(&["baseline", "init", "--format", "json"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    let actions = report["rules"].as_array().expect("actions");
+    let ignored: Vec<(&str, &str)> = actions
+        .iter()
+        .filter(|action| action["action"] == "ignored")
+        .map(|action| {
+            (
+                action["id"].as_str().expect("id"),
+                action["action"].as_str().expect("action"),
+            )
+        })
+        .collect();
+    assert!(ignored.contains(&("metric#gone", "ignored")), "{actions:?}");
+    assert!(
+        ignored.contains(&("metric#legacy", "ignored")),
+        "{actions:?}"
+    );
+    assert_eq!(
+        ignored.len(),
+        2,
+        "only the two stale artifacts: {actions:?}"
+    );
+}
+
+#[test]
+fn a_pruned_empty_scope_still_fails_a_strict_check_until_the_config_is_cleaned() {
+    let config = r#"{
+      "rules": {
+        "metric": {
+          "class": "file growth", "incident": "test", "unit": "bytes",
+          "direction": "ceiling", "description": "All Java sources", "aggregate": "max",
+          "count": {"file_metrics": {"files": ["**/*.java"], "metric": "size_bytes"}},
+          "scopes": [
+            {"id": "auth", "description": "Auth", "files": ["src/auth/**"]},
+            {"id": "legacy", "description": "Legacy", "files": ["src/legacy/**"]}
+          ]
+        }
+      }
+    }"#;
+    let before = r#"{
+      "version": 1,
+      "rules": {
+        "metric": {
+          "value": 4,
+          "scopes": {"auth": {"value": 3}, "legacy": {"value": 7}}
+        }
+      }
+    }"#;
+    let repo = Repo::plain(config, Some(before));
+    repo.write("src/auth/Login.java", "abc");
+
+    let pruned = repo.run(&["baseline", "update"]);
+    assert_eq!(code(&pruned), 0, "{}", stderr(&pruned));
+    assert!(!repo.read("ratchet.baseline.json").contains("\"legacy\""));
+
+    // The engine never mutates the config: the scope is still configured and
+    // still selects no file, so the strict check keeps failing.
+    let check = repo.run(&["check", "--strict"]);
+    assert_eq!(code(&check), 2, "{}", stderr(&check));
+    assert!(
+        stdout(&check).contains("scope legacy (Legacy) selected no files"),
+        "{}",
+        stdout(&check)
+    );
+}
+
+#[test]
+fn a_scope_whose_files_are_all_excluded_is_not_empty() {
+    let config = r#"{
+      "rules": {
+        "metric": {
+          "class": "file growth", "incident": "test", "unit": "bytes",
+          "direction": "ceiling", "description": "All Java sources", "aggregate": "max",
+          "exclude": ["src/auth/**"],
+          "count": {"file_metrics": {"files": ["**/*.java"], "metric": "size_bytes"}},
+          "scopes": [{"id": "auth", "description": "Auth", "files": ["src/auth/**"]}]
+        }
+      }
+    }"#;
+    let before = r#"{
+      "version": 1,
+      "rules": {
+        "metric": {
+          "value": 6,
+          "scopes": {"auth": {"value": 3}}
+        }
+      }
+    }"#;
+    let repo = Repo::plain(config, Some(before));
+    repo.write("src/auth/Login.java", "abc");
+    repo.write("src/Other.java", "123456");
+
+    let checked = repo.run(&["check"]);
+    assert_eq!(code(&checked), 0, "{}", stderr(&checked));
+    assert!(
+        !stderr(&checked).contains("selects no files"),
+        "{}",
+        stderr(&checked)
+    );
+    assert!(
+        !stderr(&checked).contains("matches nothing"),
+        "{}",
+        stderr(&checked)
+    );
+
+    let updated = repo.run(&["baseline", "update"]);
+    assert_eq!(code(&updated), 0, "{}", stderr(&updated));
+    let written: Value =
+        serde_json::from_str(&repo.read("ratchet.baseline.json")).expect("baseline JSON");
+    assert_eq!(
+        written["rules"]["metric"]["scopes"]["auth"]["value"], 3,
+        "the scope still matches files: it is never pruned"
+    );
+
+    let strict = repo.run(&["check", "--strict"]);
+    assert_eq!(code(&strict), 0, "{}", stderr(&strict));
+    assert!(
+        !stderr(&strict).contains("selects no files"),
+        "{}",
+        stderr(&strict)
+    );
+}
+
+#[test]
+fn the_stylish_verdict_names_a_stale_only_failure() {
+    let baseline = r#"{
+      "version": 1,
+      "rules": {
+        "todo-markers": {"value": 3},
+        "removed": {"value": 1}
+      }
+    }"#;
+    let repo = Repo::plain(ceiling_config(), Some(baseline));
+
+    let output = repo.run(&["check", "--strict"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("NOT COHERENT — 0 of 1 gates failed, 1 stale artifact"),
+        "{}",
+        stdout(&output)
+    );
+
+    let two = r#"{
+      "version": 1,
+      "rules": {
+        "todo-markers": {"value": 3},
+        "removed": {"value": 1},
+        "also-removed": {"value": 2}
+      }
+    }"#;
+    let plural = Repo::plain(ceiling_config(), Some(two));
+    let output = plural.run(&["check", "--strict"]);
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("NOT COHERENT — 0 of 1 gates failed, 2 stale artifacts"),
+        "{}",
+        stdout(&output)
+    );
+
+    // A failing gate and a stale artifact at once: the count of stale
+    // artifacts is appended to a headline that already names a failed gate
+    // (SPEC 6.1).
+    let mixed_baseline = r#"{
+      "version": 1,
+      "rules": {
+        "todo-markers": {"value": 2},
+        "removed": {"value": 1}
+      }
+    }"#;
+    let mixed = Repo::plain(ceiling_config(), Some(mixed_baseline));
+    let output = mixed.run(&["check", "--strict"]);
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("NOT COHERENT — 1 of 1 gates failed, 1 stale artifact"),
+        "{}",
+        stdout(&output)
+    );
+}
