@@ -8397,6 +8397,10 @@ fn a_failed_strict_init_creates_no_baseline_directory() {
 
 /// An item counter with a dead `exclude` pattern among expansions: note,
 /// never an error, and the note names the dead pattern.
+///
+/// The items come from a file rather than from `echo`: an argument that is
+/// itself quoted JSON is mangled by the Windows process quoting, which would
+/// turn this test into a Windows-only failure (PR #15, `windows-latest`).
 #[test]
 fn a_dead_exclude_pattern_is_a_note_in_every_mode() {
     let config = r#"{
@@ -8405,11 +8409,12 @@ fn a_dead_exclude_pattern_is_a_note_in_every_mode() {
           "class": "unfinished work", "incident": "test", "unit": "files",
           "direction": "ceiling",
           "exclude": ["a/**", "b/**", "dead/**"],
-          "count": {"command": ["echo", "[\"a/one.rs\",\"b/two.rs\"]"]}
+          "count": {"file": "items.json"}
         }
       }
     }"#;
     let repo = Repo::plain(config, Some(&baseline("items", 0)));
+    repo.write("items.json", "[\"a/one.rs\",\"b/two.rs\"]");
 
     let output = repo.run(&["check"]);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
@@ -8443,6 +8448,7 @@ fn a_dead_exclude_pattern_is_a_note_in_every_mode() {
     // A pattern that matches an item is not a note.
     let matching = config.replace("\"dead/**\"", "\"a/**\"");
     let matching_repo = Repo::plain(&matching, Some(&baseline("items", 0)));
+    matching_repo.write("items.json", "[\"a/one.rs\",\"b/two.rs\"]");
     let matched = matching_repo.run(&["check", "--strict"]);
     assert_eq!(code(&matched), 0, "{}", stderr(&matched));
     assert!(
