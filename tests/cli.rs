@@ -1711,6 +1711,27 @@ fn a_counter_error_keeps_the_metadata_of_the_rule() {
     assert_eq!(report["rules"][0]["tier"], "slow");
 }
 
+#[cfg(unix)]
+#[test]
+fn file_metrics_skips_a_symlinked_directory() {
+    // A dependency tree is full of directory links (`node_modules/typescript`).
+    // Failing closed on the first one makes every measurement in a JavaScript
+    // repository impossible, so the link is skipped and never walked.
+    let config = r#"{"rules":{"m":{"class":"c","incident":"i","unit":"lines","direction":"ceiling","aggregate":"max","count":{"file_metrics":{"files":["**/AGENTS.md"],"metric":"line_count"}}}}}"#;
+    let repo = Repo::plain(config, None);
+    repo.write("AGENTS.md", "a\nb\n");
+    let outside = Outside::new("linked-dir");
+    std::fs::write(outside.file("AGENTS.md"), "x\ny\nz\n").expect("the outside file is written");
+    std::os::unix::fs::symlink(outside.path(), repo.path().join("linked"))
+        .expect("the link is made");
+
+    let output = repo.run(&["count", "--format", "json"]);
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["rules"][0]["count"], 2, "{report}");
+}
+
 #[test]
 fn a_count_without_rules_is_a_successful_run() {
     let repo = Repo::new("[]", None);

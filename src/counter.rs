@@ -548,16 +548,23 @@ fn collect_files(
             .to_string_lossy()
             .replace('\\', "/");
         if kind.is_symlink() {
-            // A directory link could contain selected descendants, and walking
-            // through it would weaken the repository boundary. Fail closed.
-            if globs.iter().any(|glob| glob.is_match(&relative)) {
-                return Err(CounterError::runtime("file_metrics refuses symbolic links"));
-            }
             match fs::metadata(entry.path()) {
-                Ok(metadata) if metadata.is_dir() => {
-                    return Err(CounterError::runtime("file_metrics refuses symbolic links"));
+                // A directory link is **skipped**, never walked: descending
+                // through it would weaken the repository boundary, and a
+                // dependency tree full of links (`node_modules`) would make
+                // every measurement fail. The count can therefore be too low
+                // by the files behind a directory link — a rule that measures
+                // rule files accepts that, and says so.
+                Ok(metadata) if metadata.is_dir() => continue,
+                Ok(_) => {
+                    // A selected file link is refused: its target may lie
+                    // outside the repository.
+                    if globs.iter().any(|glob| glob.is_match(&relative)) {
+                        return Err(CounterError::runtime(
+                            "file_metrics refuses a symbolic link that is selected",
+                        ));
+                    }
                 }
-                Ok(_) => {}
                 // A dangling, unselected link has no descendants to collect.
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
@@ -1163,26 +1170,29 @@ mod tests {
             root.path(),
             "test",
         )
-        .expect_err("symlinks are refused");
-        assert!(error.message.contains("symbolic links"));
+        .expect_err("a selected symlink is refused");
+        assert!(error.message.contains("symbolic link"), "{}", error.message);
     }
 
     #[cfg(unix)]
     #[test]
-    fn file_metrics_refuse_unselected_symlink_directories() {
+    fn file_metrics_skip_unselected_symlink_directories() {
+        // A dependency tree is full of directory links. Failing closed on the
+        // first one would make every measurement in a JavaScript repository
+        // impossible; the link is skipped and never walked.
         let root = crate::test_tempdir::TempDir::new().expect("temporary root");
         let outside = crate::test_tempdir::TempDir::new().expect("outside root");
         fs::write(outside.path().join("A.rs"), "fn main() {}\n").expect("outside source");
         std::os::unix::fs::symlink(outside.path(), root.path().join("linked"))
             .expect("directory link");
-        let error = run_file_metrics(
-            &["src/**/*.rs".to_string()],
+        let value = run_file_metrics(
+            &["linked/**/*.rs".to_string()],
             FileMetric::SizeBytes,
             root.path(),
             "test",
         )
-        .expect_err("symlink directories fail closed");
-        assert!(error.message.contains("symbolic links"));
+        .expect("a directory link is skipped, not an error");
+        assert_eq!(value.value.measurements.unwrap_or_default().len(), 0);
     }
 
     #[test]
