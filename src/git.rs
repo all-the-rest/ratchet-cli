@@ -146,6 +146,57 @@ impl Git {
         None
     }
 
+    /// True when `reference` resolves to a commit.
+    pub fn rev_exists(&self, reference: &str) -> bool {
+        let Some(root) = self.root.as_ref() else {
+            return false;
+        };
+        run(
+            root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{reference}^{{commit}}"),
+            ],
+        )
+        .is_some()
+    }
+
+    /// The tracked files, relative to the repository root.
+    pub fn tracked_files(&self) -> Vec<String> {
+        let Some(root) = self.root.as_ref() else {
+            return Vec::new();
+        };
+        run(root, &["ls-files"])
+            .map(|text| text.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// The commits of `range` and the files each one changed.
+    ///
+    /// The record separator keeps a commit apart from its file names; a file
+    /// name is never interpolated into anything.
+    pub fn commits_with_files(&self, range: &str) -> Vec<(String, Vec<String>)> {
+        let Some(root) = self.root.as_ref() else {
+            return Vec::new();
+        };
+        let output = match run(root, &["log", "--format=%x1e%H", "--name-only", range]) {
+            Some(output) => output,
+            None => return Vec::new(),
+        };
+        let mut commits = Vec::new();
+        for record in output.split('\u{1e}') {
+            let mut lines = record.lines().filter(|line| !line.trim().is_empty());
+            let Some(commit) = lines.next() else {
+                continue;
+            };
+            let files = lines.map(str::to_string).collect();
+            commits.push((commit.to_string(), files));
+        }
+        commits
+    }
+
     /// The commits since a tag, oldest first.
     ///
     /// Without a tag the whole history is returned.  The subject, the body

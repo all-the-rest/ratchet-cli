@@ -12,7 +12,7 @@ use std::process::Command;
 use globset::GlobMatcher;
 use serde_json::Value;
 
-use crate::config::{Counter, FileMetric};
+use crate::config::{AgentRule, Counter, FileMetric};
 use crate::generate::Generator;
 use crate::issues;
 use crate::registry::{Finding, Registry, Severity, Status};
@@ -105,6 +105,9 @@ pub fn run_counter(counter: &Counter, root: &Path, path: &str) -> Result<Counter
         Counter::Command { command } => run_command(command, root),
         Counter::FileMetrics { file_metrics } => {
             run_file_metrics(&file_metrics.files, file_metrics.metric, root, path)
+        }
+        Counter::AgentRule { agent_rule, since } => {
+            run_agent_rule(*agent_rule, since.as_deref(), root, path)
         }
         Counter::File {
             file,
@@ -800,6 +803,166 @@ fn transcript(command: &[String], output: &std::process::Output) -> String {
     )
 }
 
+/// Runs a built-in agent rule (SPEC 3.8).
+///
+/// A built-in rule reads git and the working tree directly. It has no script,
+/// no path and no drift: the counter that ships with the binary is the one the
+/// rule names.
+fn run_agent_rule(
+    rule: AgentRule,
+    since: Option<&str>,
+    root: &Path,
+    _path: &str,
+) -> Result<CounterRun, CounterError> {
+    let git = crate::git::Git::discover(root);
+    let value = match rule {
+        AgentRule::RuleFileName => {
+            let items: Vec<String> = git
+                .tracked_files()
+                .into_iter()
+                .filter(|file| is_misnamed_rule_file(file))
+                .collect();
+            CounterValue {
+                count: Some(items.len() as i64),
+                items: Some(items),
+                measurements: None,
+            }
+        }
+        AgentRule::RuleFilePresent => count_value(i64::from(root.join("AGENTS.md").is_file())),
+        AgentRule::PlanStatusLine => {
+            count_value(plans_without_status(&root.join("docs").join("plans")))
+        }
+        AgentRule::GatesUntouched => {
+            let range = if git.rev_exists("origin/main") {
+                "origin/main..HEAD".to_string()
+            } else if git.rev_exists("@{u}") {
+                "@{u}..HEAD".to_string()
+            } else {
+                String::new()
+            };
+            if range.is_empty() {
+                count_value(0)
+            } else {
+                count_value(
+                    git.commits_with_files(&range)
+                        .iter()
+                        .filter(|(_, files)| disarms_a_gate(files))
+                        .count() as i64,
+                )
+            }
+        }
+        AgentRule::UnverifiedCommits => {
+            let commits = git.commits_since(since).unwrap_or_default();
+            count_value(
+                commits
+                    .iter()
+                    .filter(|commit| !has_verify_footer(commit))
+                    .count() as i64,
+            )
+        }
+    };
+    Ok(CounterRun {
+        value,
+        output: String::new(),
+        findings: None,
+    })
+}
+
+/// A scalar count without items.
+fn count_value(count: i64) -> CounterValue {
+    CounterValue {
+        count: Some(count),
+        items: None,
+        measurements: None,
+    }
+}
+
+/// A tracked rule file whose name is not exactly `AGENTS.md`.
+///
+/// The comparison is case-sensitive on purpose: a harness looks the name up
+/// exactly, so `Agents.md` is the defect, not a style question.
+fn is_misnamed_rule_file(file: &str) -> bool {
+    let name = file.rsplit('/').next().unwrap_or(file);
+    name.eq_ignore_ascii_case("agents.md") && name != "AGENTS.md"
+}
+
+/// Plans in `directory` without a `**Status:**` line in the first 15 lines.
+fn plans_without_status(directory: &Path) -> i64 {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return 0;
+    };
+    let mut missing = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let head: String = text.lines().take(15).collect::<Vec<_>>().join("\n");
+        if !head.contains("**Status:**") {
+            missing += 1;
+        }
+    }
+    missing
+}
+
+/// Paths whose change can disarm the check that would catch the mistake.
+fn is_gate_path(file: &str) -> bool {
+    if file.starts_with(".github/workflows/")
+        || file.starts_with(".github/actions/")
+        || file.starts_with(".githooks/")
+        || file.starts_with(".agents/gates/")
+    {
+        return true;
+    }
+    if file == "scripts/gates.sh"
+        || file == "ratchet.config.jsonc"
+        || file == "ratchet.config.json"
+        || file == "ratchet.baseline.json"
+    {
+        return true;
+    }
+    let name = file.rsplit('/').next().unwrap_or(file);
+    name.starts_with("check_") && name.ends_with(".sh")
+}
+
+/// Whether a file is product code rather than documentation or a rule file.
+///
+/// A fix that also documents itself is the normal case; the rule guards the
+/// one commit that changes what is checked and what runs.
+fn is_product_path(file: &str) -> bool {
+    if is_gate_path(file) {
+        return false;
+    }
+    if file.starts_with("docs/") || file.contains("/docs/") {
+        return false;
+    }
+    let name = file.rsplit('/').next().unwrap_or(file);
+    if name == "AGENTS.md" {
+        return false;
+    }
+    !matches!(
+        file.rsplit('.').next().unwrap_or(""),
+        "md" | "txt" | "json" | "yaml" | "yml"
+    )
+}
+
+/// A commit that changes a gate and product code at once.
+fn disarms_a_gate(files: &[String]) -> bool {
+    files.iter().any(|f| is_gate_path(f)) && files.iter().any(|f| is_product_path(f))
+}
+
+/// Whether a commit message carries a `Verify:` footer.
+fn has_verify_footer(commit: &crate::git::Commit) -> bool {
+    commit
+        .body
+        .lines()
+        .chain(std::iter::once(commit.subject.as_str()))
+        .any(|line| line.trim_start().starts_with("Verify:"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1092,5 +1255,55 @@ mod tests {
         assert!(matcher("src/*").is_match("src/a.ts"));
         assert!(!matcher("src/*").is_match("src/nested/a.ts"));
         assert!(matcher("src/**").is_match("src/nested/a.ts"));
+    }
+
+    #[test]
+    fn a_rule_file_with_the_wrong_case_is_the_defect() {
+        assert!(is_misnamed_rule_file("Agents.md"));
+        assert!(is_misnamed_rule_file("pkg/agents.md"));
+        assert!(!is_misnamed_rule_file("AGENTS.md"));
+        assert!(!is_misnamed_rule_file("pkg/AGENTS.md"));
+        assert!(!is_misnamed_rule_file("README.md"));
+    }
+
+    #[test]
+    fn documentation_and_rule_files_are_not_product_code() {
+        assert!(!is_product_path("docs/plans/a.md"));
+        assert!(!is_product_path("src/AGENTS.md"));
+        assert!(!is_product_path(".github/workflows/ci.yml"));
+        assert!(is_product_path("src/main.rs"));
+        assert!(is_product_path("scripts/deploy.sh"));
+    }
+
+    #[test]
+    fn a_commit_touching_a_gate_and_code_is_flagged() {
+        let both = vec![
+            "scripts/check_sizes.sh".to_string(),
+            "src/main.rs".to_string(),
+        ];
+        assert!(disarms_a_gate(&both));
+        let gate_only = vec![".github/workflows/ci.yml".to_string()];
+        assert!(!disarms_a_gate(&gate_only));
+        let code_only = vec!["src/main.rs".to_string()];
+        assert!(!disarms_a_gate(&code_only));
+        let gate_and_docs = vec![
+            ".githooks/pre-commit".to_string(),
+            "docs/agents.md".to_string(),
+        ];
+        assert!(!disarms_a_gate(&gate_and_docs));
+    }
+
+    #[test]
+    fn a_plan_without_a_status_line_is_counted() {
+        let root = std::env::temp_dir().join(format!("ratchet-plans-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mkdir");
+        let root = root.as_path();
+        fs::write(root.join("with.md"), "# T\n**Status:** Plan\n").expect("write");
+        fs::write(root.join("without.md"), "# T\nkein Status\n").expect("write");
+        fs::write(root.join("ignored.txt"), "kein Status\n").expect("write");
+        assert_eq!(plans_without_status(root), 1);
+        assert_eq!(plans_without_status(&root.join("missing")), 0);
+        let _ = fs::remove_dir_all(root);
     }
 }

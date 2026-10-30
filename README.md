@@ -88,6 +88,27 @@ cargo build && ./target/debug/ratchet check
 The checks run on pull requests and on `merge_group`; merge through the queue,
 which squashes the PR into one commit on `main`.
 
+## Presets — one rule set, many repositories
+
+A config object may name a preset that ships with the binary:
+
+```jsonc
+[{ "preset": "agent-rules" }]
+```
+
+`agent-rules` is the canonical six-rule set every project of ours adopts: the
+rule file must be named `AGENTS.md`, must exist, must stay short, plans must
+carry a state, a commit may not disarm the gate that guards it, and a commit
+carries its verification evidence. The rules run on counters compiled into the
+binary, so adopting the preset is one line — no script to copy, no path to
+resolve, no copy that drifts. An object after the preset overrides a rule by
+id, or adds its own.
+
+A preset is not a file: `ratchet` has no `extends`, and every path a project
+names lies inside its own repository root, so a shared rule set cannot be
+shared *as a path*. It is shared as a version — the one the binary was built
+with.
+
 ## Configuration
 
 The config is the only source of truth for the rules. It is a *flat* config in

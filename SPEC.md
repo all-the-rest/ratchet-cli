@@ -148,6 +148,7 @@ shorthand for a one-element array.
 | Field | Type | Meaning |
 |---|---|---|
 | `name` | string | optional label for this config object |
+| `preset` | string | a rule set shipped with the binary, merged **before** this object (see 3.8) |
 | `tiers` | object | per-tier settings (see 3.3) |
 | `generated` | array | drift-gate entries (see §7) |
 | `verify` | array | pre-release checks (see §15) |
@@ -220,6 +221,7 @@ Exactly one of:
 { "registry": "ratchet.findings.json", "severities": ["critical", "high"], "statuses": ["open", "in-progress"] }
 { "issues": { "repository": "owner/repo", "label": "ratchet" }, "severities": ["critical", "high"], "statuses": ["open"] }
 { "file_metrics": { "files": ["**/*.java"], "metric": "size_bytes" } }
+{ "agent_rule": "unverified-commits", "since": "2026-10-30" }
 ```
 
 * `command` — an argv array. **No shell** is involved; the arguments are passed
@@ -325,6 +327,54 @@ Known limitation: a repository path containing a backslash cannot be loaded
 through the JS bridge (node rejects the percent-encoded backslash in a file
 URL). The failure is closed — the error names the cause. Use
 `ratchet.config.jsonc` in such a checkout.
+
+### 3.8 Presets and built-in agent rules
+
+A config object may name a **preset**: a rule set that ships with the binary.
+The preset is merged *before* the object's own fields, so an object can add
+rules or override one of the preset's rules by id.
+
+```jsonc
+[
+  { "preset": "agent-rules" },
+  { "rules": { "unverified-commits": { /* overrides the preset's rule */ } } }
+]
+```
+
+A preset exists because `ratchet` has no `extends` across repositories: every
+path a project names lies **inside** the repository root, so a rule set shared
+between projects cannot be a file. A preset is versioned by the binary that
+ships it — "every project runs the same rules" becomes a fact about the
+release instead of a convention about copies.
+
+The presets:
+
+| Preset | Rules |
+|---|---|
+| `agent-rules` | `rule-file-name`, `rule-file-present`, `rule-file-max-lines`, `plan-status-line`, `gates-untouched`, `unverified-commits` |
+
+The rules use the `agent_rule` counter, which runs a check compiled into the
+binary — no script, no path, no drift between a rule and its counter:
+
+| `agent_rule` | Counts |
+|---|---|
+| `rule-file-name` | tracked files named like `AGENTS.md` but spelled differently (case-sensitive) |
+| `rule-file-present` | 1 when the root `AGENTS.md` exists, else 0 — used with `direction: floor` |
+| `plan-status-line` | `docs/plans/*.md` without `**Status:**` in the first 15 lines; 0 without the directory |
+| `gates-untouched` | commits not yet on `origin/main` (else `@{u}`) that change a gate path and product code in the same commit |
+| `unverified-commits` | commits whose message has no `Verify:` line, in the window given by `since` (optional, `YYYY-MM-DD`) |
+
+`since` belongs to `unverified-commits` alone; on any other rule it is a
+configuration error, because a fixed tree cannot have an epoch. Without
+`since` the whole history is counted: the number only grows, so the gate still
+catches every new commit without a footer, and the baseline stays where it is.
+
+The gate paths of `gates-untouched` are `.github/workflows/`,
+`.github/actions/`, `.githooks/`, `.agents/gates/`, `scripts/gates.sh`,
+`scripts/check_*.sh`, `ratchet.config.jsonc`, `ratchet.config.json` and
+`ratchet.baseline.json`. Documentation (`docs/`, `*.md`, `*.json`, `*.yaml`,
+`*.yml`) and the rule files themselves never count as product code: a fix that
+documents itself is the normal case.
 
 ### 3.7 Glob patterns
 

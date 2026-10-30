@@ -27,6 +27,107 @@ pub const CONFIG_FILE_NAMES: [&str; 4] = [
 /// Default baseline file name; resolved next to the config.
 pub const DEFAULT_BASELINE_FILE: &str = "ratchet.baseline.json";
 
+/// The names a `count.agent_rule` counter accepts, for error messages.
+pub const AGENT_RULE_NAMES: &str = "\"rule-file-name\", \"rule-file-present\", \"plan-status-line\", \
+     \"gates-untouched\", \"unverified-commits\"";
+
+/// The presets a config object may name in `preset`.
+pub const PRESET_NAMES: &str = "\"agent-rules\"";
+
+/// The `agent-rules` preset: the canonical rule set a project adopts.
+///
+/// It lives in the binary on purpose. `ratchet` has no `extends` across
+/// repositories — a path may not leave the repository root — so a rule set
+/// that is shared between projects cannot be a file. A preset is versioned by
+/// the binary that ships it, which makes "every project runs the same rules"
+/// a fact about the release rather than a convention about copies.
+///
+/// `unverified-commits` carries no epoch here: the count over the whole
+/// history still catches every new commit without a footer, because the
+/// number only grows. A project that releases tags can narrow the window by
+/// overriding the rule with a `since` date.
+const AGENT_RULES_PRESET: &str = r#"
+{
+  "name": "agent-rules (preset)",
+  "rules": {
+    "rule-file-name": {
+      "class": "a rule file the harness cannot see",
+      "incident": "LuminaRust, jku-itpj2627-webshop-base and all-the-rest-skills carried `Agents.md`; tools that look up `AGENTS.md` by exact name never loaded it",
+      "unit": "rule files with the wrong file name",
+      "direction": "ceiling",
+      "description": "counts every tracked `AGENTS.md` whose spelling differs — the comparison is case-sensitive by design",
+      "count": { "agent_rule": "rule-file-name" }
+    },
+    "rule-file-present": {
+      "class": "a project without rules",
+      "incident": "noema had three workflows and a clean verification history but no project rules at all — the practice lived only in the global config",
+      "unit": "root rule files",
+      "direction": "floor",
+      "description": "1 when `AGENTS.md` exists at the repository root, 0 when it does not",
+      "count": { "agent_rule": "rule-file-present" }
+    },
+    "rule-file-max-lines": {
+      "class": "a rule file drifting into a specification",
+      "incident": "LuminaRust/Agents.md reached 623 lines and open-accreditation 380: architecture, stack and release runbook in the file every session loads",
+      "unit": "lines in the longest rule file",
+      "direction": "ceiling",
+      "aggregate": "max",
+      "description": "the largest `AGENTS.md` in the tree, measured in lines; the paydown is a module-local `AGENTS.md` next to the code it describes",
+      "count": { "file_metrics": { "files": ["**/AGENTS.md"], "metric": "line_count" } }
+    },
+    "plan-status-line": {
+      "class": "a plan without a state",
+      "incident": "LuminaRust had six plan documents and no status line in two of them — 'done', 'planned' and 'recommendation' were indistinguishable",
+      "unit": "plans without a status line",
+      "direction": "ceiling",
+      "description": "counts `docs/plans/*.md` that do not carry `**Status:**` within their first 15 lines; without a `docs/plans/` directory the count is 0",
+      "count": { "agent_rule": "plan-status-line" }
+    },
+    "gates-untouched": {
+      "class": "a gate disarmed by the change it should catch",
+      "incident": "the gates run from the working tree, so one commit can weaken the check scripts and the code they guard together",
+      "unit": "commits that change a gate and product code at once",
+      "direction": "ceiling",
+      "description": "counts the commits not yet on `origin/main` that touch a gate path and product code in the same commit; documentation and rule files do not count as product code",
+      "count": { "agent_rule": "gates-untouched" }
+    },
+    "unverified-commits": {
+      "class": "a commit with no verification evidence",
+      "incident": "eight repositories carry a `Verify:` footer in 20 of 20 commits while ai-10-usd carries it in 3 of 20 — the convention exists, the enforcement does not",
+      "unit": "commits without a `Verify:` footer",
+      "direction": "ceiling",
+      "description": "counts the commits of the history whose message has no `Verify:` line; a project with tagged releases narrows the window with `since`",
+      "count": { "agent_rule": "unverified-commits" }
+    }
+  }
+}
+"#;
+
+/// Resolves a preset name into the config object it stands for.
+fn preset_value(name: &str) -> Result<Value, ConfigError> {
+    match name {
+        "agent-rules" => json5::from_str(AGENT_RULES_PRESET).map_err(|error| {
+            ConfigError::new("preset", format!("the built-in preset is invalid: {error}"))
+        }),
+        other => Err(ConfigError::new(
+            "preset",
+            format!("unknown preset \"{other}\" — expected {PRESET_NAMES}"),
+        )),
+    }
+}
+
+/// Whether `text` is a calendar date in the one shape the counters accept.
+fn is_iso_date(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+}
+
 /// A configuration error. `path` points at the offending field.
 #[derive(Debug, Clone)]
 pub struct ConfigError {
@@ -148,6 +249,17 @@ pub enum Counter {
         #[serde(skip_serializing_if = "Option::is_none")]
         statuses: Option<Vec<Status>>,
     },
+    /// A built-in repository check (SPEC 3.8). The processes are shipped with
+    /// the binary, so a rule set that uses them is portable across
+    /// repositories without carrying a script.
+    AgentRule {
+        /// Which check to run.
+        agent_rule: AgentRule,
+        /// The epoch of a counting window, `YYYY-MM-DD`; only read by the
+        /// rules that count history.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        since: Option<String>,
+    },
     /// The findings of a GitHub repository; the count is the number of the
     /// issues that count (SPEC 13).
     Issues {
@@ -178,6 +290,45 @@ pub enum FileMetric {
     MaxLineLength,
 }
 
+/// A check that ships with the binary (SPEC 3.8).
+///
+/// Every variant answers a question about the repository that git and the
+/// working tree can answer without a project-owned script: no script to copy,
+/// no path to resolve, no drift between a rule and its counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentRule {
+    /// Tracked files named like `AGENTS.md` but spelled differently.
+    RuleFileName,
+    /// Whether the repository has a root `AGENTS.md`.
+    RuleFilePresent,
+    /// Plans under `docs/plans/` without a `**Status:**` line near the top.
+    PlanStatusLine,
+    /// Commits that change a gate and product code at once.
+    GatesUntouched,
+    /// Commits whose message carries no `Verify:` footer.
+    UnverifiedCommits,
+}
+
+impl AgentRule {
+    /// The name used in configs and reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentRule::RuleFileName => "rule-file-name",
+            AgentRule::RuleFilePresent => "rule-file-present",
+            AgentRule::PlanStatusLine => "plan-status-line",
+            AgentRule::GatesUntouched => "gates-untouched",
+            AgentRule::UnverifiedCommits => "unverified-commits",
+        }
+    }
+
+    /// Whether the check reads the commit history — and therefore accepts a
+    /// `since` epoch.
+    pub fn counts_history(self) -> bool {
+        matches!(self, AgentRule::UnverifiedCommits)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileMetrics {
     pub files: Vec<String>,
@@ -195,6 +346,10 @@ impl Counter {
                     file_metrics.files, file_metrics.metric
                 )
             }
+            Counter::AgentRule { agent_rule, since } => match since {
+                Some(since) => format!("agent_rule {} since {since}", agent_rule.as_str()),
+                None => format!("agent_rule {}", agent_rule.as_str()),
+            },
             Counter::File {
                 file,
                 path,
@@ -645,6 +800,7 @@ fn merge_object(config: &mut Config, value: &Value) -> Result<(), ConfigError> {
         map,
         &[
             "name",
+            "preset",
             "tiers",
             "generated",
             "verify",
@@ -654,6 +810,13 @@ fn merge_object(config: &mut Config, value: &Value) -> Result<(), ConfigError> {
         ],
         "",
     )?;
+
+    // The preset is the base of this object: it is merged first, so every
+    // field the object carries itself wins over the preset.
+    if let Some(preset) = map.get("preset") {
+        let name = expect_string(preset, "preset")?;
+        merge_object(config, &preset_value(&name)?)?;
+    }
 
     if let Some(name) = map.get("name") {
         config.name = Some(expect_string(name, "name")?);
@@ -1135,7 +1298,14 @@ fn parse_counter(value: &Value, path: &str) -> Result<Counter, ConfigError> {
 
     // Exactly one form per counter: a counter that says two things at once
     // does not say which one counts.
-    let forms = ["command", "file", "registry", "issues", "file_metrics"];
+    let forms = [
+        "command",
+        "file",
+        "registry",
+        "issues",
+        "file_metrics",
+        "agent_rule",
+    ];
     let present: Vec<&str> = forms
         .iter()
         .copied()
@@ -1185,6 +1355,49 @@ fn parse_counter(value: &Value, path: &str) -> Result<Counter, ConfigError> {
             Ok(Counter::FileMetrics {
                 file_metrics: FileMetrics { files, metric },
             })
+        }
+        ["agent_rule"] => {
+            check_unknown(map, &["agent_rule", "since"], path)?;
+            let name = require_string(map, "agent_rule", path)?;
+            let agent_rule = match name.as_str() {
+                "rule-file-name" => AgentRule::RuleFileName,
+                "rule-file-present" => AgentRule::RuleFilePresent,
+                "plan-status-line" => AgentRule::PlanStatusLine,
+                "gates-untouched" => AgentRule::GatesUntouched,
+                "unverified-commits" => AgentRule::UnverifiedCommits,
+                other => {
+                    return Err(ConfigError::new(
+                        format!("{path}.agent_rule"),
+                        format!(
+                            "unknown agent rule \"{other}\" — expected one of {}",
+                            AGENT_RULE_NAMES
+                        ),
+                    ));
+                }
+            };
+            let since = match map.get("since") {
+                None => None,
+                Some(value) => {
+                    let since = expect_string(value, &format!("{path}.since"))?;
+                    if !agent_rule.counts_history() {
+                        return Err(ConfigError::new(
+                            format!("{path}.since"),
+                            format!(
+                                "\"{}\" does not read the commit history, so it takes no epoch",
+                                agent_rule.as_str()
+                            ),
+                        ));
+                    }
+                    if !is_iso_date(&since) {
+                        return Err(ConfigError::new(
+                            format!("{path}.since"),
+                            format!("expected a date as YYYY-MM-DD, found \"{since}\""),
+                        ));
+                    }
+                    Some(since)
+                }
+            };
+            Ok(Counter::AgentRule { agent_rule, since })
         }
         ["file"] => {
             check_unknown(map, &["file", "path", "generate", "output_arg"], path)?;
@@ -2126,5 +2339,82 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn the_agent_rules_preset_merges_the_canonical_six() {
+        let config = parse_config_str(r#"{ "preset": "agent-rules" }"#).expect("preset parses");
+        assert_eq!(config.rules.len(), 6);
+        for id in [
+            "rule-file-name",
+            "rule-file-present",
+            "rule-file-max-lines",
+            "plan-status-line",
+            "gates-untouched",
+            "unverified-commits",
+        ] {
+            assert!(config.rules.contains_key(id), "{id} missing");
+        }
+        let present = &config.rules["rule-file-present"];
+        assert_eq!(present.direction, Direction::Floor);
+    }
+
+    #[test]
+    fn an_object_extends_the_preset_with_its_own_rules() {
+        let config = parse_config_str(
+            r#"[
+                { "preset": "agent-rules" },
+                { "rules": { "own-rule": {
+                    "class": "c", "incident": "i", "unit": "u", "direction": "ceiling",
+                    "count": { "command": ["true"] } } } }
+            ]"#,
+        )
+        .expect("config parses");
+        assert_eq!(config.rules.len(), 7);
+        assert!(config.rules.contains_key("own-rule"));
+    }
+
+    #[test]
+    fn an_unknown_preset_is_an_error() {
+        let error = parse_config_str(r#"{ "preset": "nope" }"#).expect_err("fails");
+        assert!(
+            error.message.contains("unknown preset"),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains("agent-rules"));
+    }
+
+    #[test]
+    fn an_epoch_belongs_only_to_a_history_rule() {
+        let error = parse_config_str(
+            r#"{ "rules": { "a": {
+                "class": "c", "incident": "i", "unit": "u", "direction": "ceiling",
+                "count": { "agent_rule": "rule-file-name", "since": "2026-10-30" } } } }"#,
+        )
+        .expect_err("fails");
+        assert!(error.message.contains("does not read the commit history"));
+    }
+
+    #[test]
+    fn the_epoch_must_be_a_calendar_date() {
+        let error = parse_config_str(
+            r#"{ "rules": { "a": {
+                "class": "c", "incident": "i", "unit": "u", "direction": "ceiling",
+                "count": { "agent_rule": "unverified-commits", "since": "30.10.2026" } } } }"#,
+        )
+        .expect_err("fails");
+        assert!(error.message.contains("YYYY-MM-DD"));
+    }
+
+    #[test]
+    fn an_unknown_agent_rule_names_the_known_ones() {
+        let error = parse_config_str(
+            r#"{ "rules": { "a": {
+                "class": "c", "incident": "i", "unit": "u", "direction": "ceiling",
+                "count": { "agent_rule": "nope" } } } }"#,
+        )
+        .expect_err("fails");
+        assert!(error.message.contains("rule-file-present"));
     }
 }
