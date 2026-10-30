@@ -105,3 +105,9 @@ block is written by `ratchet release`.
 ### Fixed
 
 - skip symlinked directories instead of failing (#19) (file_metrics)
+
+## [0.6.2] - 2026-10-30
+
+### Fixed
+
+- do not count automation commits as unverified (#22) (agent-rules)
