@@ -92,3 +92,10 @@ block is written by `ratchet release`.
 ### Fixed
 
 - ignore unselected symlink files (file-metrics)
+
+## [0.6.0] - 2026-10-30
+
+### Added
+
+- tolerate outdated exception artifacts and add --strict (#15) (stale)
+- ship the agent-rules preset with built-in counters (#16) (config)
