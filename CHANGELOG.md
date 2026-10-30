@@ -99,3 +99,9 @@ block is written by `ratchet release`.
 
 - tolerate outdated exception artifacts and add --strict (#15) (stale)
 - ship the agent-rules preset with built-in counters (#16) (config)
+
+## [0.6.1] - 2026-10-30
+
+### Fixed
+
+- skip symlinked directories instead of failing (#19) (file_metrics)

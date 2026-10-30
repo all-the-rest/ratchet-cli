@@ -1,6 +1,6 @@
 [package]
 name = "ratchet"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Ratchet gates: a count compared against a baseline that may only move in one declared direction."
