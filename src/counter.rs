@@ -863,7 +863,7 @@ fn run_agent_rule(
             count_value(
                 commits
                     .iter()
-                    .filter(|commit| !has_verify_footer(commit))
+                    .filter(|commit| !is_automation(commit) && !has_verify_footer(commit))
                     .count() as i64,
             )
         }
@@ -959,6 +959,21 @@ fn is_product_path(file: &str) -> bool {
 /// A commit that changes a gate and product code at once.
 fn disarms_a_gate(files: &[String]) -> bool {
     files.iter().any(|f| is_gate_path(f)) && files.iter().any(|f| is_product_path(f))
+}
+
+/// Whether the commit was produced by automation rather than a person or an
+/// agent session.
+///
+/// A scheduled data refresh has no verification story to tell, and counting it
+/// would turn the gate red on every bot push — a gate that fires on noise gets
+/// muted. Automation is named by its author, the one thing a bot cannot fake
+/// by accident.
+fn is_automation(commit: &crate::git::Commit) -> bool {
+    let author = commit.author.to_ascii_lowercase();
+    author.ends_with("[bot]")
+        || author.contains("github-actions")
+        || author.contains("dependabot")
+        || author.contains("renovate")
 }
 
 /// Whether a commit message carries a `Verify:` footer.
@@ -1301,6 +1316,27 @@ mod tests {
             "docs/agents.md".to_string(),
         ];
         assert!(!disarms_a_gate(&gate_and_docs));
+    }
+
+    #[test]
+    fn automation_is_not_asked_for_a_verification_story() {
+        let bot = crate::git::Commit {
+            subject: "chore: update data".to_string(),
+            date: "2026-10-30".to_string(),
+            author: "github-actions[bot]".to_string(),
+            body: String::new(),
+        };
+        assert!(is_automation(&bot));
+        let human = crate::git::Commit {
+            author: "dev".to_string(),
+            ..bot.clone()
+        };
+        assert!(!is_automation(&human));
+        let dependabot = crate::git::Commit {
+            author: "dependabot[bot]".to_string(),
+            ..bot.clone()
+        };
+        assert!(is_automation(&dependabot));
     }
 
     #[test]

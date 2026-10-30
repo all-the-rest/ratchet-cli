@@ -206,7 +206,7 @@ impl Git {
         let root = self.root.as_ref()?;
         // The fields are separated by a unit separator, the records by a
         // record separator: a commit message may hold anything else.
-        let format = "--format=%s%x1f%cs%x1f%b%x1e";
+        let format = "--format=%s%x1f%cs%x1f%an%x1f%b%x1e";
         let range = match since {
             Some(tag) => format!("{tag}..HEAD"),
             None => "HEAD".to_string(),
@@ -225,6 +225,8 @@ pub struct Commit {
     pub date: String,
     /// The body of the commit.
     pub body: String,
+    /// The author name (`%an`).
+    pub author: String,
 }
 
 /// Parses the commits of the output of `git log`.
@@ -238,10 +240,12 @@ fn parse_commits(output: &str) -> Vec<Commit> {
         let mut fields = record.split('\u{1f}');
         let subject = fields.next().unwrap_or_default().to_string();
         let date = fields.next().unwrap_or_default().to_string();
+        let author = fields.next().unwrap_or_default().to_string();
         let body = fields.next().unwrap_or_default().to_string();
         commits.push(Commit {
             subject,
             date,
+            author,
             body,
         });
     }
