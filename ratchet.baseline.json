@@ -5,6 +5,9 @@
       "value": 8,
       "reason": "the self-update needs an HTTPS client and a SHA-256 implementation"
     },
+    "gates-untouched": {
+      "value": 0
+    },
     "no-machine-path-in-source": {
       "value": 0
     },
@@ -16,6 +19,21 @@
     },
     "no-unsafe-in-source": {
       "value": 0
+    },
+    "plan-status-line": {
+      "value": 0
+    },
+    "rule-file-max-lines": {
+      "value": 84
+    },
+    "rule-file-name": {
+      "value": 0
+    },
+    "rule-file-present": {
+      "value": 1
+    },
+    "unverified-commits": {
+      "value": 19
     }
   }
 }

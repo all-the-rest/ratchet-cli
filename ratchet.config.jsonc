@@ -6,6 +6,7 @@
 // count is zero today is a boolean gate — no occurrence may appear — and
 // only `dependency-count` is a ratchet: its baseline may only decrease.
 [
+  { "preset": "agent-rules" },
   {
     "name": "ratchet-cli",
     "release": {
