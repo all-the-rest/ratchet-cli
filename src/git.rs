@@ -206,7 +206,7 @@ impl Git {
         let root = self.root.as_ref()?;
         // The fields are separated by a unit separator, the records by a
         // record separator: a commit message may hold anything else.
-        let format = "--format=%s%x1f%cs%x1f%an%x1f%b%x1e";
+        let format = "--format=%s%x1f%cs%x1f%an%x1f%P%x1f%b%x1e";
         let range = match since {
             Some(tag) => format!("{tag}..HEAD"),
             None => "HEAD".to_string(),
@@ -227,6 +227,8 @@ pub struct Commit {
     pub body: String,
     /// The author name (`%an`).
     pub author: String,
+    /// The number of parents: more than one means a merge commit.
+    pub parents: usize,
 }
 
 /// Parses the commits of the output of `git log`.
@@ -241,11 +243,13 @@ fn parse_commits(output: &str) -> Vec<Commit> {
         let subject = fields.next().unwrap_or_default().to_string();
         let date = fields.next().unwrap_or_default().to_string();
         let author = fields.next().unwrap_or_default().to_string();
+        let parents = fields.next().unwrap_or_default().split_whitespace().count();
         let body = fields.next().unwrap_or_default().to_string();
         commits.push(Commit {
             subject,
             date,
             author,
+            parents,
             body,
         });
     }

@@ -863,7 +863,7 @@ fn run_agent_rule(
             count_value(
                 commits
                     .iter()
-                    .filter(|commit| !is_automation(commit) && !has_verify_footer(commit))
+                    .filter(|commit| counts_as_unverified(commit))
                     .count() as i64,
             )
         }
@@ -974,6 +974,15 @@ fn is_automation(commit: &crate::git::Commit) -> bool {
         || author.contains("github-actions")
         || author.contains("dependabot")
         || author.contains("renovate")
+}
+
+/// Whether the commit counts as unverified.
+///
+/// A merge commit is not a unit of authoring: GitHub's synthetic PR merge
+/// carries the PR author and no footer, so counting it would fail every human
+/// pull request. Automation has no verification story to tell either.
+fn counts_as_unverified(commit: &crate::git::Commit) -> bool {
+    commit.parents <= 1 && !is_automation(commit) && !has_verify_footer(commit)
 }
 
 /// Whether a commit message carries a `Verify:` footer.
@@ -1319,11 +1328,34 @@ mod tests {
     }
 
     #[test]
+    fn a_merge_commit_is_not_counted_as_unverified() {
+        let merge = crate::git::Commit {
+            subject: "Merge branch 'x'".to_string(),
+            date: "2026-10-31".to_string(),
+            author: "dev".to_string(),
+            parents: 2,
+            body: String::new(),
+        };
+        assert!(!counts_as_unverified(&merge));
+        let single = crate::git::Commit {
+            parents: 1,
+            ..merge.clone()
+        };
+        assert!(counts_as_unverified(&single));
+        let verified = crate::git::Commit {
+            body: "Verify: ratchet check green".to_string(),
+            ..single
+        };
+        assert!(!counts_as_unverified(&verified));
+    }
+
+    #[test]
     fn automation_is_not_asked_for_a_verification_story() {
         let bot = crate::git::Commit {
             subject: "chore: update data".to_string(),
             date: "2026-10-30".to_string(),
             author: "github-actions[bot]".to_string(),
+            parents: 1,
             body: String::new(),
         };
         assert!(is_automation(&bot));
