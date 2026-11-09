@@ -1733,6 +1733,53 @@ fn file_metrics_skips_a_symlinked_directory() {
 }
 
 #[test]
+fn file_metrics_exclude_git_ignored_paths_by_default_and_allow_overrides() {
+    let template = r#"{"rules":{"m":{"class":"c","incident":"i","unit":"lines","direction":"ceiling","aggregate":"max","count":{"file_metrics":{"files":["**/AGENTS.md"],"metric":"line_count"OPTIONS}}}}}"#;
+    let config = template.replace("OPTIONS", "");
+    let repo = Repo::plain(&config, Some(&baseline("m", 2)));
+    repo.write(".gitignore", "target/\n");
+    repo.write("AGENTS.md", "one\ntwo\n");
+    repo.git(&["init", "-q"]);
+    repo.git(&[
+        "add",
+        "ratchet.config.jsonc",
+        "ratchet.baseline.json",
+        ".gitignore",
+        "AGENTS.md",
+    ]);
+    repo.git(&["commit", "-q", "-m", "initial"]);
+    repo.write("target/AGENTS.md", "one\ntwo\nthree\nfour\n");
+
+    let output = repo.run(&["count", "--format", "json"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["rules"][0]["count"], 2, "{report}");
+
+    let opt_out = template.replace("OPTIONS", ",\"respect_gitignore\":false");
+    repo.write("ratchet.config.jsonc", &opt_out);
+    let output = repo.run(&["count", "--format", "json"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["rules"][0]["count"], 4, "{report}");
+
+    let custom_exclude = template.replace(
+        "OPTIONS",
+        ",\"respect_gitignore\":false,\"exclude\":[\"target/**\"]",
+    );
+    repo.write("ratchet.config.jsonc", &custom_exclude);
+    repo.write("generated/AGENTS.md", "one\ntwo\nthree\nfour\nfive\n");
+    let output = repo.run(&["count", "--format", "json", "--ignore", "generated/**"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["rules"][0]["count"], 2, "{report}");
+
+    let output = repo.run(&["check", "--format", "json", "--ignore", "generated/**"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).expect("the stdout is JSON");
+    assert_eq!(report["rules"][0]["count"], 2, "{report}");
+}
+
+#[test]
 fn a_count_without_rules_is_a_successful_run() {
     let repo = Repo::new("[]", None);
 

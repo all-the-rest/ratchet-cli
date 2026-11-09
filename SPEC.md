@@ -285,6 +285,11 @@ symbolic-link file is ignored. Symbolic-link directories are refused rather
 than traversed, so selected files cannot be silently omitted or read outside
 the repository tree.
 
+Ignored paths are excluded by Git's ignore rules by default; set
+`respect_gitignore: false` to measure them. The per-counter `exclude` list and
+the CLI `--ignore` patterns also exclude matching paths, independently of
+`respect_gitignore`.
+
 Named scopes take this shape:
 
 ```jsonc
@@ -461,12 +466,14 @@ The default command is `check`.
 | `--quiet` | only print failures |
 | `--version`, `--help` | |
 
-`--ignore` takes glob patterns of paths to exclude from the selection. A rule
+`--ignore` takes glob patterns of paths to exclude from the selection and from
+per-file metric measurements. A rule
 whose scope does not intersect the remaining paths is skipped. Ignoring a path
 never turns a failing gate green: a rule that would have run on the ignored
 path still runs on the rest.
 
-`--ignore` applies to the **rules' path scope**. It does not exclude a drift
+`--ignore` applies to the **rules' path scope** (and to metric measurements).
+It does not exclude a drift
 gate: a generated file is registered deliberately, and a pattern that happens to
 match it must not silently disable the gate.
 

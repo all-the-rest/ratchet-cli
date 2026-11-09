@@ -101,10 +101,20 @@ pub struct CounterRun {
 /// `path` is the path of the counter in the config (`rules.a.count`): a
 /// counter that is misconfigured names it.
 pub fn run_counter(counter: &Counter, root: &Path, path: &str) -> Result<CounterRun, CounterError> {
+    run_counter_with_ignore(counter, root, path, &[])
+}
+
+/// Runs a counter, excluding the CLI ignore globs from file metrics.
+pub fn run_counter_with_ignore(
+    counter: &Counter,
+    root: &Path,
+    path: &str,
+    ignore: &[GlobMatcher],
+) -> Result<CounterRun, CounterError> {
     let run = match counter {
         Counter::Command { command } => run_command(command, root),
         Counter::FileMetrics { file_metrics } => {
-            run_file_metrics(&file_metrics.files, file_metrics.metric, root, path)
+            run_file_metrics_with(file_metrics, root, path, ignore)
         }
         Counter::AgentRule { agent_rule, since } => {
             run_agent_rule(*agent_rule, since.as_deref(), root, path)
@@ -436,32 +446,58 @@ fn non_negative(count: i64) -> Result<i64, CounterError> {
     Ok(count)
 }
 
-fn run_file_metrics(
-    patterns: &[String],
-    metric: FileMetric,
+fn run_file_metrics_with(
+    metrics: &crate::config::FileMetrics,
     root: &Path,
     path: &str,
+    ignore: &[GlobMatcher],
 ) -> Result<CounterRun, CounterError> {
-    let globs = crate::config::compile_globs(patterns, &format!("{path}.file_metrics.files"))
+    let globs = crate::config::compile_globs(&metrics.files, &format!("{path}.file_metrics.files"))
         .map_err(|error| CounterError::config(error.to_string()))?;
+    let exclude_globs =
+        crate::config::compile_globs(&metrics.exclude, &format!("{path}.file_metrics.exclude"))
+            .map_err(|error| CounterError::config(error.to_string()))?;
     let mut paths = Vec::new();
-    collect_files(root, root, &globs, &mut paths)?;
+    collect_files(root, root, &mut paths)?;
     paths.sort();
+    paths.retain(|(relative, _, _)| {
+        globs.iter().any(|glob| glob.is_match(relative))
+            && !exclude_globs.iter().any(|glob| glob.is_match(relative))
+            && !ignore.iter().any(|glob| glob.is_match(relative))
+    });
+    if metrics.respect_gitignore {
+        let ignored =
+            git_ignored_paths(root, paths.iter().map(|(relative, _, _)| relative.as_str()))?;
+        paths.retain(|(relative, _, _)| !ignored.contains(relative));
+    }
     let mut measurements = Vec::new();
-    for (relative, full) in paths {
-        if !globs.iter().any(|glob| glob.is_match(&relative)) {
-            continue;
+    for (relative, full, is_symlink) in paths {
+        if is_symlink {
+            match fs::metadata(&full) {
+                Ok(metadata) if metadata.is_dir() => continue,
+                Ok(_) => {
+                    return Err(CounterError::runtime(
+                        "file_metrics refuses a symbolic link that is selected",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(CounterError::runtime(format!(
+                        "cannot inspect symbolic link {relative}: {error}"
+                    )));
+                }
+            }
         }
         let bytes = fs::read(&full)
             .map_err(|error| CounterError::runtime(format!("cannot read {relative}: {error}")))?;
-        let value = match metric {
+        let value = match metrics.metric {
             FileMetric::SizeBytes => i64::try_from(bytes.len())
                 .map_err(|_| CounterError::runtime("file is too large to measure"))?,
             FileMetric::LineCount | FileMetric::MaxLineLength => {
                 let text = std::str::from_utf8(&bytes)
                     .map_err(|_| CounterError::runtime(format!("{relative} is not UTF-8")))?;
                 let (line_count, max_line_length) = line_metrics(text);
-                let count = if metric == FileMetric::LineCount {
+                let count = if metrics.metric == FileMetric::LineCount {
                     line_count
                 } else {
                     max_line_length
@@ -484,6 +520,85 @@ fn run_file_metrics(
         output: String::new(),
         findings: None,
     })
+}
+
+#[cfg(test)]
+fn run_file_metrics(
+    patterns: &[String],
+    metric: FileMetric,
+    root: &Path,
+    path: &str,
+) -> Result<CounterRun, CounterError> {
+    let metrics = crate::config::FileMetrics {
+        files: patterns.to_vec(),
+        metric,
+        respect_gitignore: true,
+        exclude: Vec::new(),
+    };
+    run_file_metrics_with(&metrics, root, path, &[])
+}
+
+fn git_ignored_paths<'a>(
+    root: &Path,
+    paths: impl Iterator<Item = &'a str>,
+) -> Result<std::collections::HashSet<String>, CounterError> {
+    use std::io::Write;
+    let repo = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(root)
+        .output()
+        .map_err(|e| CounterError::runtime(format!("cannot run git: {e}")))?;
+    if !repo.status.success() {
+        if root
+            .ancestors()
+            .any(|ancestor| ancestor.join(".git").exists())
+        {
+            return Err(CounterError::runtime(
+                "git rev-parse failed while checking ignore rules",
+            ));
+        }
+        return Ok(std::collections::HashSet::new());
+    }
+    let mut child = Command::new("git")
+        .args(["check-ignore", "--stdin", "-z"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| CounterError::runtime(format!("cannot run git check-ignore: {e}")))?;
+    let paths: Vec<String> = paths.map(str::to_string).collect();
+    let stdin = child.stdin.take().ok_or_else(|| {
+        CounterError::runtime("cannot send paths to git check-ignore: stdin is unavailable")
+    })?;
+    // Drain Git's output while feeding paths: a large set of ignored files can
+    // fill the output pipe before Git has consumed all of its input.
+    let writer = std::thread::spawn(move || {
+        let mut stdin = stdin;
+        for path in paths {
+            stdin.write_all(path.as_bytes())?;
+            stdin.write_all(&[0])?;
+        }
+        Ok::<(), std::io::Error>(())
+    });
+    let output = child
+        .wait_with_output()
+        .map_err(|e| CounterError::runtime(format!("cannot read git check-ignore: {e}")))?;
+    writer
+        .join()
+        .map_err(|_| CounterError::runtime("git check-ignore input thread failed"))?
+        .map_err(|e| {
+            CounterError::runtime(format!("cannot send paths to git check-ignore: {e}"))
+        })?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(CounterError::runtime("git check-ignore failed"));
+    }
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect())
 }
 
 fn line_metrics(text: &str) -> (usize, usize) {
@@ -528,8 +643,7 @@ fn line_metrics(text: &str) -> (usize, usize) {
 fn collect_files(
     root: &Path,
     directory: &Path,
-    globs: &[GlobMatcher],
-    out: &mut Vec<(String, std::path::PathBuf)>,
+    out: &mut Vec<(String, std::path::PathBuf, bool)>,
 ) -> Result<(), CounterError> {
     let entries = fs::read_dir(directory).map_err(|error| {
         CounterError::runtime(format!("cannot read repository directory: {error}"))
@@ -548,37 +662,15 @@ fn collect_files(
             .to_string_lossy()
             .replace('\\', "/");
         if kind.is_symlink() {
-            match fs::metadata(entry.path()) {
-                // A directory link is **skipped**, never walked: descending
-                // through it would weaken the repository boundary, and a
-                // dependency tree full of links (`node_modules`) would make
-                // every measurement fail. The count can therefore be too low
-                // by the files behind a directory link — a rule that measures
-                // rule files accepts that, and says so.
-                Ok(metadata) if metadata.is_dir() => continue,
-                Ok(_) => {
-                    // A selected file link is refused: its target may lie
-                    // outside the repository.
-                    if globs.iter().any(|glob| glob.is_match(&relative)) {
-                        return Err(CounterError::runtime(
-                            "file_metrics refuses a symbolic link that is selected",
-                        ));
-                    }
-                }
-                // A dangling, unselected link has no descendants to collect.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(CounterError::runtime(format!(
-                        "cannot inspect symbolic link {relative}: {error}"
-                    )));
-                }
-            }
+            // Defer file-link refusal (and directory-link skipping) until
+            // metric, custom, CLI and Git exclusions have been applied.
+            out.push((relative, entry.path(), true));
             continue;
         }
         if kind.is_dir() {
-            collect_files(root, &entry.path(), globs, out)?;
+            collect_files(root, &entry.path(), out)?;
         } else if kind.is_file() {
-            out.push((relative, entry.path()));
+            out.push((relative, entry.path(), false));
         }
     }
     Ok(())
@@ -1154,6 +1246,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn file_metrics_excludes_custom_and_cli_globs_even_when_gitignore_is_disabled() {
+        let root = crate::test_tempdir::TempDir::new().expect("temporary root");
+        fs::write(root.path().join("keep.java"), "x").expect("keep");
+        fs::write(root.path().join("custom.java"), "xx").expect("custom exclude");
+        fs::write(root.path().join("cli.java"), "xxx").expect("CLI exclude");
+        let exclude = vec!["custom.java".to_string()];
+        let metrics = crate::config::FileMetrics {
+            files: vec!["*.java".to_string()],
+            metric: FileMetric::SizeBytes,
+            respect_gitignore: false,
+            exclude: exclude.clone(),
+        };
+        let ignore = crate::config::compile_globs(&["cli.java".to_string()], "test").expect("glob");
+        let result =
+            run_file_metrics_with(&metrics, root.path(), "test", &ignore).expect("metrics");
+        let measured: Vec<_> = result
+            .value
+            .measurements
+            .expect("measurements")
+            .into_iter()
+            .map(|m| m.path)
+            .collect();
+        assert_eq!(measured, vec!["keep.java"]);
+    }
+
+    #[test]
+    fn file_metrics_respects_gitignore_by_default_but_never_ignores_tracked_files() {
+        let root = crate::test_tempdir::TempDir::new().expect("temporary root");
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        fs::write(root.path().join("tracked.java"), "t").expect("tracked");
+        git(&["add", "-f", "tracked.java"]);
+        fs::write(root.path().join(".gitignore"), "*.java\n").expect("ignore rules");
+        fs::write(root.path().join("ignored.java"), "i").expect("ignored");
+        git(&["add", ".gitignore"]);
+        let metrics = crate::config::FileMetrics {
+            files: vec!["*.java".to_string()],
+            metric: FileMetric::SizeBytes,
+            respect_gitignore: true,
+            exclude: Vec::new(),
+        };
+        let result = run_file_metrics_with(&metrics, root.path(), "test", &[]).expect("metrics");
+        let measured: Vec<_> = result
+            .value
+            .measurements
+            .expect("measurements")
+            .into_iter()
+            .map(|m| m.path)
+            .collect();
+        assert_eq!(measured, vec!["tracked.java"]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn file_metrics_ignore_unselected_symlink_files() {
@@ -1177,6 +1329,41 @@ mod tests {
         )
         .expect("unselected symlink is ignored");
         assert_eq!(result.value.measurements.expect("measurements").len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_metrics_exclude_symlinks_before_refusing_selected_links() {
+        let root = crate::test_tempdir::TempDir::new().expect("temporary root");
+        let outside = crate::test_tempdir::TempDir::new().expect("outside root");
+        fs::write(outside.path().join("A.java"), "x").expect("outside source");
+        fs::write(root.path().join(".gitignore"), "git.java\n").expect("ignore rule");
+        let status = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root.path())
+            .status()
+            .expect("git");
+        assert!(status.success(), "git init failed");
+        std::os::unix::fs::symlink(
+            outside.path().join("A.java"),
+            root.path().join("custom.java"),
+        )
+        .expect("custom-excluded link");
+        std::os::unix::fs::symlink(outside.path().join("A.java"), root.path().join("cli.java"))
+            .expect("CLI-excluded link");
+        std::os::unix::fs::symlink(outside.path().join("A.java"), root.path().join("git.java"))
+            .expect("Git-ignored link");
+        let metrics = crate::config::FileMetrics {
+            files: vec!["*.java".to_string()],
+            metric: FileMetric::SizeBytes,
+            respect_gitignore: true,
+            exclude: vec!["custom.java".to_string()],
+        };
+        let ignore = crate::config::compile_globs(&["cli.java".to_string()], "test")
+            .expect("valid ignore glob");
+        let result = run_file_metrics_with(&metrics, root.path(), "test", &ignore)
+            .expect("excluded symlinks do not fail the metric");
+        assert!(result.value.measurements.expect("measurements").is_empty());
     }
 
     #[cfg(unix)]

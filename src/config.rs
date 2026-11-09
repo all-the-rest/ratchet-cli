@@ -333,6 +333,11 @@ impl AgentRule {
 pub struct FileMetrics {
     pub files: Vec<String>,
     pub metric: FileMetric,
+    /// Exclude Git-ignored paths by default. False opts in to measuring them;
+    /// `exclude` and CLI `--ignore` still apply.
+    pub respect_gitignore: bool,
+    /// Additional repository-relative globs excluded from measurements.
+    pub exclude: Vec<String>,
 }
 
 impl Counter {
@@ -1328,7 +1333,7 @@ fn parse_counter(value: &Value, path: &str) -> Result<Counter, ConfigError> {
             let metrics = expect_object(&map["file_metrics"], &format!("{path}.file_metrics"))?;
             check_unknown(
                 metrics,
-                &["files", "metric"],
+                &["files", "metric", "respect_gitignore", "exclude"],
                 &format!("{path}.file_metrics"),
             )?;
             let files = require_string_array(metrics, "files", &format!("{path}.file_metrics"))?;
@@ -1352,8 +1357,26 @@ fn parse_counter(value: &Value, path: &str) -> Result<Counter, ConfigError> {
                     ));
                 }
             };
+            let respect_gitignore = match metrics.get("respect_gitignore") {
+                None => true,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => {
+                    return Err(ConfigError::new(
+                        format!("{path}.file_metrics.respect_gitignore"),
+                        "expected a boolean",
+                    ));
+                }
+            };
+            let exclude =
+                optional_string_array(metrics, "exclude", &format!("{path}.file_metrics"))?;
+            compile_globs(&exclude, &format!("{path}.file_metrics.exclude"))?;
             Ok(Counter::FileMetrics {
-                file_metrics: FileMetrics { files, metric },
+                file_metrics: FileMetrics {
+                    files,
+                    metric,
+                    respect_gitignore,
+                    exclude,
+                },
             })
         }
         ["agent_rule"] => {
@@ -1922,6 +1945,34 @@ mod tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn file_metrics_ignore_defaults_and_excludes_are_validated() {
+        let config = parse_config_str(r#"{"rules":{"r":{"class":"growth","incident":"test","unit":"bytes","direction":"ceiling","aggregate":"max","count":{"file_metrics":{"files":["**/*.java"],"metric":"size_bytes"}}}}}"#).expect("config");
+        let file_metrics = match &config.rules["r"].count {
+            Counter::FileMetrics { file_metrics } => Some(file_metrics),
+            _ => None,
+        };
+        let file_metrics = file_metrics.expect("file_metrics counter");
+        assert!(file_metrics.respect_gitignore);
+        assert!(file_metrics.exclude.is_empty());
+        let json = serde_json::to_string(&config).expect("resolved config serialization");
+        assert!(!json.contains("exclude_globs"));
+
+        let custom = r#"{"rules":{"r":{"class":"growth","incident":"test","unit":"bytes","direction":"ceiling","aggregate":"max","count":{"file_metrics":{"files":["**/*.java"],"metric":"size_bytes","respect_gitignore":false,"exclude":["vendor/**"]}}}}}"#;
+        let config = parse_config_str(custom).expect("custom excludes");
+        let file_metrics = match &config.rules["r"].count {
+            Counter::FileMetrics { file_metrics } => Some(file_metrics),
+            _ => None,
+        };
+        let file_metrics = file_metrics.expect("file_metrics counter");
+        assert!(!file_metrics.respect_gitignore);
+        assert_eq!(file_metrics.exclude, vec!["vendor/**"]);
+        let invalid = custom.replace("[\"vendor/**\"]", "[3]");
+        assert!(parse_config_str(&invalid).is_err());
+        let invalid_glob = custom.replace("vendor/**", "[");
+        assert!(parse_config_str(&invalid_glob).is_err());
     }
 
     #[test]

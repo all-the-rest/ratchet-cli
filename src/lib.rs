@@ -317,12 +317,13 @@ fn run_gates(cli: &Cli, context: &Context, run: &Run<'_>) -> Result<check::Repor
         ignore: &ignore,
         strict: cli.strict,
     };
-    let mut report = check::check(
+    let mut report = check::check_with_ignore(
         &context.config,
         &baseline,
         committed.as_ref(),
         &context.root,
         &selection,
+        &ignore,
     );
     report.generated = drift.entries;
     report.notes.extend(notes);
@@ -687,7 +688,9 @@ fn resolved_config(config: &Config) -> String {
 fn cmd_count(cli: &Cli, cwd: &Path) -> Result<i32, Error> {
     let context = load_context(cli, cwd)?;
     ensure_rule_exists(&context.config, cli.rule.as_deref())?;
-    let mut report = check::counts(&context.config, &context.root, cli.rule.as_deref());
+    let ignore = compile_ignore(&cli.ignore)?;
+    let mut report =
+        check::counts_with_ignore(&context.config, &context.root, cli.rule.as_deref(), &ignore);
     if cli.debug {
         report.debug.insert(0, resolved_config(&context.config));
     }
@@ -727,6 +730,7 @@ fn preflight_stale(
     context: &Context,
     baseline: &Baseline,
     rule_filter: Option<&str>,
+    ignore: &[globset::GlobMatcher],
     runs: &mut std::collections::BTreeMap<String, counter::CounterRun>,
 ) -> Result<Vec<stale::Stale>, Error> {
     let mut artifacts = Vec::new();
@@ -741,8 +745,13 @@ fn preflight_stale(
         if rule.scopes.is_empty() && rule.aggregate.is_none() {
             continue;
         }
-        let run = counter::run_counter(&rule.count, &context.root, &format!("rules.{id}.count"))
-            .map_err(|error| Error::new(error.message))?;
+        let run = counter::run_counter_with_ignore(
+            &rule.count,
+            &context.root,
+            &format!("rules.{id}.count"),
+            ignore,
+        )
+        .map_err(|error| Error::new(error.message))?;
         let measurements = run.value.measurements.as_ref().ok_or_else(|| {
             Error::new(format!(
                 "config error: a rule with aggregate or scopes must emit per-file measurements \
@@ -765,6 +774,7 @@ fn preflight_stale(
 
 fn cmd_baseline(cli: &Cli, cwd: &Path, update: bool, reason: Option<&str>) -> Result<i32, Error> {
     let context = load_context(cli, cwd)?;
+    let ignore = compile_ignore(&cli.ignore)?;
     let mut baseline = Baseline::load_if_exists(Some(&context.root), &context.baseline_path)?;
 
     ensure_rule_exists(&context.config, cli.rule.as_deref())?;
@@ -781,7 +791,13 @@ fn cmd_baseline(cli: &Cli, cwd: &Path, update: bool, reason: Option<&str>) -> Re
     let mut preflight: std::collections::BTreeMap<String, counter::CounterRun> =
         std::collections::BTreeMap::new();
     if !update && cli.strict {
-        let artifacts = preflight_stale(&context, &baseline, cli.rule.as_deref(), &mut preflight)?;
+        let artifacts = preflight_stale(
+            &context,
+            &baseline,
+            cli.rule.as_deref(),
+            &ignore,
+            &mut preflight,
+        )?;
         if !artifacts.is_empty() {
             let messages: Vec<String> = artifacts
                 .iter()
@@ -887,7 +903,12 @@ fn cmd_baseline(cli: &Cli, cwd: &Path, update: bool, reason: Option<&str>) -> Re
         let counter_path = format!("rules.{id}.count");
         let run = match preflight.remove(id) {
             Some(run) => run,
-            None => match counter::run_counter(&rule.count, &context.root, &counter_path) {
+            None => match counter::run_counter_with_ignore(
+                &rule.count,
+                &context.root,
+                &counter_path,
+                &ignore,
+            ) {
                 Ok(run) => run,
                 Err(error) => {
                     counter_errors += 1;

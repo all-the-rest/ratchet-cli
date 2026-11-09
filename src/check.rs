@@ -280,6 +280,25 @@ pub fn check(
     root: &std::path::Path,
     selection: &Selection<'_>,
 ) -> Report {
+    check_with_ignore(
+        config,
+        baseline,
+        committed,
+        root,
+        selection,
+        selection.ignore,
+    )
+}
+
+/// Runs the gates and applies `ignore` to per-file metric measurements.
+pub fn check_with_ignore(
+    config: &Config,
+    baseline: &Baseline,
+    committed: Option<&Baseline>,
+    root: &std::path::Path,
+    selection: &Selection<'_>,
+    ignore: &[GlobMatcher],
+) -> Report {
     let mut report = Report::default();
     // Stale artifacts are accumulated as they are found: every one is
     // reported, not only the first (SPEC 5.2).  Without `--strict` each is a
@@ -309,7 +328,12 @@ pub fn check(
         stale.extend(stale::unknown_scopes(rule, baseline));
         report.executed += 1;
 
-        let run = match counter::run_counter(&rule.count, root, &format!("rules.{id}.count")) {
+        let run = match counter::run_counter_with_ignore(
+            &rule.count,
+            root,
+            &format!("rules.{id}.count"),
+            ignore,
+        ) {
             Ok(run) => run,
             Err(error) => {
                 push_counter_error(&mut report, id, rule, error);
@@ -849,6 +873,16 @@ pub fn selected_paths(
 
 /// Builds the report of a `count` run: the counts without a comparison.
 pub fn counts(config: &Config, root: &std::path::Path, rule_filter: Option<&str>) -> Report {
+    counts_with_ignore(config, root, rule_filter, &[])
+}
+
+/// Builds a count report and applies `ignore` to per-file metric measurements.
+pub fn counts_with_ignore(
+    config: &Config,
+    root: &std::path::Path,
+    rule_filter: Option<&str>,
+    ignore: &[GlobMatcher],
+) -> Report {
     let mut report = Report::default();
     for (id, rule) in &config.rules {
         if let Some(filter) = rule_filter {
@@ -857,7 +891,12 @@ pub fn counts(config: &Config, root: &std::path::Path, rule_filter: Option<&str>
             }
         }
         report.executed += 1;
-        let run = match counter::run_counter(&rule.count, root, &format!("rules.{id}.count")) {
+        let run = match counter::run_counter_with_ignore(
+            &rule.count,
+            root,
+            &format!("rules.{id}.count"),
+            ignore,
+        ) {
             Ok(run) => run,
             Err(error) => {
                 push_counter_error(&mut report, id, rule, error);
