@@ -111,3 +111,9 @@ block is written by `ratchet release`.
 ### Fixed
 
 - do not count automation commits as unverified (#22) (agent-rules)
+
+## [0.6.4] - 2026-11-09
+
+### Fixed
+
+- exclude git-ignored paths by default (#26) (file-metrics)
