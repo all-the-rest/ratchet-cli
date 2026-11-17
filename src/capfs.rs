@@ -265,8 +265,9 @@ impl RootDir {
 
     /// Rechecks the captured directory and removes it if empty. On Unix the
     /// captured handles are dropped before root-relative `remove_dir`. On
-    /// Windows only the leaf handle is dropped, and removal is relative to its
-    /// retained parent capability; the rest of the chain pins ancestors. A
+    /// Windows the leaf handle is dropped for the capability-relative removal
+    /// and the whole chain is released once the directory is gone, so an
+    /// ancestor held open by another tracked child can be removed in turn. A
     /// replacement in the final check-to-operation interval remains the
     /// documented narrow race.
     pub fn remove_tracked_dir(&self, directory: &mut TrackedDir) -> io::Result<bool> {
@@ -293,7 +294,14 @@ impl RootDir {
                 io::Error::other("the tracked directory has no retained parent capability")
             })?;
             directory.handles.pop();
-            directory.handles[parent_index].remove_dir(&directory.name)
+            let removed = directory.handles[parent_index].remove_dir(&directory.name);
+            // Windows refuses to remove a directory that still has an open
+            // handle. Another tracked child can still hold an ancestor of this
+            // directory open, so release the whole chain once the leaf is gone.
+            if removed.is_ok() {
+                directory.handles.clear();
+            }
+            removed
         };
         #[cfg(not(windows))]
         let removed = {

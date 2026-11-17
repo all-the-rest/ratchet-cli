@@ -819,8 +819,10 @@ The generator must be able to write to a **given path**:
      failure. Removal uses `Dir::remove_dir` relative to the retained
      repository capability on Unix. On Windows, the leaf handle has to be
      released because cap-std directory handles deny delete sharing; removal
-     is then relative to its retained parent capability while ancestor
-     handles remain pinned. The final identity check and removal are not
+     is then relative to its retained parent capability. The whole handle
+     chain is released after a successful removal, so an ancestor held open
+     by another tracked child can be removed in turn. The final identity check
+     and removal are not
      atomic, so a replacement in that narrow check-to-operation interval may
      still be removed. The rooted operation cannot traverse outside the
      repository. This race is accepted;
@@ -846,8 +848,10 @@ The generator must be able to write to a **given path**:
      or containment fails, it leaves the path and reports an operational
      error.
      Removal is relative to the retained root capability on Unix and to a
-     retained parent capability on Windows, so the check and removal have a
-     narrow, unavoidable TOCTOU race: a replacement in that interval may be
+     retained parent capability on Windows; the retained handles are released
+     after a successful removal so ancestors can be removed in turn. The check
+     and removal therefore have a narrow, unavoidable TOCTOU race: a replacement
+     in that interval may be
      removed. This race is accepted after the identity and root-containment
      checks; the operation is not an atomic identity-bound deletion. A cleanup
      error names every directory it could not remove relative to the repository
