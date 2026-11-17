@@ -760,7 +760,7 @@ fn remove_created_directory(filesystem: &RootDir, directory: &mut TrackedDir) ->
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn remove_created_directory_with<F>(
     filesystem: &RootDir,
     directory: &mut TrackedDir,
@@ -1365,6 +1365,7 @@ fn read_file_state(filesystem: &RootDir, path: &Path) -> io::Result<Option<FileS
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::fs;
 
     fn filesystem(root: &crate::test_tempdir::TempDir) -> RootDir {
