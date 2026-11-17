@@ -16,6 +16,9 @@ name = "ratchet"
 path = "src/main.rs"
 
 [dependencies]
+# Engine-owned filesystem operations must stay within the retained repository
+# root even when a child command redirects an ancestor path.
+cap-std = "4.0.3"
 clap = { version = "4", features = ["derive"] }
 globset = "0.4"
 json5 = "0.4"
@@ -26,7 +29,3 @@ serde_json = "1"
 # binary.  The hash is the RustCrypto implementation of SHA-256.
 sha2 = "0.11"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
-
-[target.'cfg(windows)'.dependencies]
-# ReFS can require the full 128-bit file ID to distinguish directories.
-file-id = "0.2.3"

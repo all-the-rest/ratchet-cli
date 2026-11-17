@@ -6,6 +6,7 @@
 //! normative description of the behaviour.
 
 pub mod baseline;
+pub mod capfs;
 pub mod check;
 pub mod config;
 pub mod counter;

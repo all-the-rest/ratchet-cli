@@ -17,13 +17,13 @@
 //! not against the working-tree copy: the gate asks whether the repository
 //! holds what the generator produces.
 
-use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
 use crate::Error;
+use crate::capfs::{RootDir, TrackedDir};
 use crate::config::{Config, Generated, Tier};
 use crate::diff;
 use crate::fsutil;
@@ -84,6 +84,13 @@ pub struct Options<'a> {
     pub tier: Option<Tier>,
 }
 
+/// The configured path, its resolved link-entry name, and its resolved target.
+struct TargetPaths<'a> {
+    resolved: &'a Path,
+    named: &'a Path,
+    target: &'a Path,
+}
+
 /// The result of a drift run.
 #[derive(Debug, Default)]
 pub struct Outcome {
@@ -108,6 +115,8 @@ impl Outcome {
 /// Runs the drift gates of the `generated` entries of the config.
 pub fn run(config: &Config, git: &Git, options: &Options) -> Result<Outcome, Error> {
     let mut outcome = Outcome::default();
+    let filesystem = RootDir::open(options.root)
+        .map_err(|error| Error::new(format!("cannot open the repository root: {error}")))?;
 
     if !git.is_repo() {
         // The committed comparisons are skipped; the gate still runs (SPEC 8).
@@ -148,7 +157,13 @@ pub fn run(config: &Config, git: &Git, options: &Options) -> Result<Outcome, Err
         // that file back — while the temporary-output mode never touches
         // the tree, but the comparison would follow the link to a file that
         // is not there.
-        if is_dangling_link(options.root, &entry.path) {
+        let named_target = named_target(options.root, &filesystem, &entry.path, &resolved);
+        let resolved_target = filesystem.relative(&resolved).map_err(|error| {
+            Error::new(format!(
+                "{subject} cannot be used through the repository root: {error}"
+            ))
+        })?;
+        if is_dangling_link(&filesystem, &named_target, &resolved_target) {
             let reason = if entry.output_arg.is_some() {
                 "the comparison would follow it to a file that is not there"
             } else {
@@ -177,7 +192,19 @@ pub fn run(config: &Config, git: &Git, options: &Options) -> Result<Outcome, Err
             }
         }
         selected += 1;
-        let result = run_one(entry, git, options, &mut outcome.debug, &resolved)?;
+        let target_paths = TargetPaths {
+            resolved: &resolved,
+            named: &named_target,
+            target: &resolved_target,
+        };
+        let result = run_one(
+            entry,
+            git,
+            options,
+            &mut outcome.debug,
+            &target_paths,
+            &filesystem,
+        )?;
         outcome.entries.push(result);
     }
 
@@ -196,10 +223,10 @@ fn run_one(
     git: &Git,
     options: &Options,
     debug: &mut Vec<String>,
-    resolved: &Path,
+    paths: &TargetPaths<'_>,
+    filesystem: &RootDir,
 ) -> Result<DriftEntry, Error> {
     let root = options.root;
-    let target = root.join(&entry.path);
 
     let produced = match &entry.output_arg {
         Some(output_arg) => {
@@ -214,13 +241,13 @@ fn run_one(
             debug.push(format!("generator {}: {}", entry.path, artifact.output));
             artifact.bytes
         }
-        None => produce_in_place(entry, root, options, debug, resolved)?,
+        None => produce_in_place(entry, root, options, debug, paths, filesystem)?,
     };
 
     // The comparison is against the committed file (SPEC §7).  The lookup
     // uses the file the system resolves the named path to — the same file the
     // generator wrote; the report and the messages keep the named path.
-    let lookup = committed_path(root, &entry.path, resolved);
+    let lookup = committed_path(&entry.path, paths.target);
     let (status, committed) = compare(git, &lookup, &entry.path, &produced)?;
 
     let mut detail = None;
@@ -250,7 +277,7 @@ fn run_one(
         match status {
             DriftStatus::Drift => {
                 if entry.output_arg.is_some() {
-                    write_fixed(root, &target, &entry.path, resolved, &produced)?;
+                    write_fixed(root, filesystem, paths.target, &entry.path, &produced)?;
                 }
                 detail = Some(
                     "the produced content was written to the working tree; commit it — the committed file is still stale"
@@ -259,9 +286,9 @@ fn run_one(
             }
             DriftStatus::New => {
                 let written = if entry.output_arg.is_some() {
-                    let current = fs::read(&target).ok();
+                    let current = filesystem.read(paths.target).ok();
                     if current.as_deref() != Some(produced.as_slice()) {
-                        write_fixed(root, &target, &entry.path, resolved, &produced)?;
+                        write_fixed(root, filesystem, paths.target, &entry.path, &produced)?;
                         true
                     } else {
                         false
@@ -294,16 +321,30 @@ fn run_one(
 /// The generator would write through such a link and create the file behind
 /// it — and the restore cannot take that file back: the tree would change,
 /// and nobody was told about it.
-fn is_dangling_link(root: &Path, relative: &str) -> bool {
-    let target = root.join(relative);
-    let Ok(metadata) = fs::symlink_metadata(&target) else {
+fn named_target(root: &Path, filesystem: &RootDir, relative: &str, resolved: &Path) -> PathBuf {
+    let named = Path::new(relative);
+    let Some(name) = named.file_name() else {
+        return resolved.to_path_buf();
+    };
+    let parent = named.parent().unwrap_or_else(|| Path::new("."));
+    let Ok(parent) = path::inside_repository(root, &parent.to_string_lossy()) else {
+        return resolved.to_path_buf();
+    };
+    let Ok(parent) = filesystem.relative(&parent) else {
+        return resolved.to_path_buf();
+    };
+    parent.join(name)
+}
+
+fn is_dangling_link(filesystem: &RootDir, named: &Path, resolved: &Path) -> bool {
+    let Ok(metadata) = filesystem.symlink_metadata(named) else {
         return false;
     };
-    if !metadata.file_type().is_symlink() {
+    if !metadata.is_symlink() {
         return false;
     }
     // The link is followed: a link that points at nothing fails here.
-    fs::metadata(&target).is_err()
+    filesystem.metadata(resolved).is_err()
 }
 
 /// The path the comparison is made against.
@@ -313,8 +354,13 @@ fn is_dangling_link(root: &Path, relative: &str) -> bool {
 /// tree holds the target of the link and not the link.  The path is relative
 /// to the repository root; the report and the messages keep the **named**
 /// path — the path the project named and the path the user knows.
-fn committed_path(root: &Path, relative: &str, resolved: &Path) -> String {
-    path::relative_to(&path::canonical_root(root), resolved).unwrap_or_else(|| relative.to_string())
+fn committed_path(relative: &str, resolved: &Path) -> String {
+    let resolved = resolved.to_string_lossy().replace('\\', "/");
+    if resolved.is_empty() {
+        relative.to_string()
+    } else {
+        resolved
+    }
 }
 
 /// Compares the produced content with the committed file.
@@ -369,21 +415,21 @@ fn produce_in_place(
     root: &Path,
     options: &Options,
     debug: &mut Vec<String>,
-    resolved: &Path,
+    paths: &TargetPaths<'_>,
+    filesystem: &RootDir,
 ) -> Result<Vec<u8>, Error> {
-    let target = root.join(&entry.path);
-    let display = path::display(Some(root), &target);
+    let display = entry.path.as_str();
 
     // 1. the snapshot: the original bytes, the file mode and the time the
     //    file was written last.
-    let mut snapshot = Snapshot::take(&target)
+    let mut snapshot = Snapshot::take(filesystem, paths.target, paths.named)
         .map_err(|error| Error::new(format!("cannot read {display}: {error}")))?;
 
     // 1b. the marker: the file is touched with an old time, so that the
     //     engine can tell whether the generator wrote it — whatever the
     //     timestamp granularity of the filesystem is.
     let marker = fsutil::marker_time();
-    let _ = fsutil::set_modified(&target, marker);
+    let _ = filesystem.set_modified(paths.target, marker);
 
     // 1c. the directories the file needs are created if they do not exist: a
     //     generator that writes a file into a new directory would otherwise
@@ -403,33 +449,34 @@ fn produce_in_place(
     //     named as it was created — the resolved one as the system resolves
     //     it, the named one as the project named it — and it is the place the
     //     user has to look.
-    let created = create_directories(root, &entry.path, resolved).map_err(|error| {
-        Error::new(format!(
-            "cannot create the directory {} of {display}: {}{}",
-            directory_name(root, &error.directory),
-            error.cause,
-            error.rollback_message(root)
-        ))
-    })?;
+    let created =
+        create_directories(root, filesystem, &entry.path, paths.resolved).map_err(|error| {
+            Error::new(format!(
+                "cannot create the directory {} of {display}: {}{}",
+                directory_name(root, &error.directory),
+                error.cause,
+                error.rollback_message(root)
+            ))
+        })?;
     snapshot.created = created;
 
     // 2. the generator.
-    let run = run_generator(&entry.command, root, &display, debug);
+    let run = run_generator(&entry.command, root, display, debug);
 
     // 3. the produced bytes.
-    let produced = fs::read(&target).ok();
+    let produced = snapshot.read_current(filesystem).ok();
 
     // 3b. did the generator write the file?  A generator that leaves it alone
     //     produced nothing: the comparison below would compare the committed
     //     file with itself and report a green that says nothing.
-    let wrote = snapshot.was_written(&target, produced.as_deref(), marker);
+    let wrote = snapshot.was_written(filesystem, produced.as_deref(), marker);
 
     // 4. restore and verify for an ordinary check; keep the produced content
     //    for --fix.
     let restored = if options.fix {
-        snapshot.keep(root, resolved)
+        snapshot.keep(root, paths.resolved, filesystem)
     } else {
-        snapshot.restore(root)
+        snapshot.restore(root, filesystem)
     };
 
     // A failed restore or keep is the more important error: the working tree
@@ -460,69 +507,15 @@ fn produce_in_place(
     Ok(produced)
 }
 
-/// The identity captured for a directory the engine created.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DirectoryIdentity {
-    #[cfg(unix)]
-    Unix { device: u64, inode: u64 },
-    #[cfg(windows)]
-    Windows { volume: u64, file: u128 },
-}
-
-impl DirectoryIdentity {
-    fn capture(path: &Path, handle: &fs::File) -> io::Result<Self> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-
-            let _ = path;
-            let metadata = handle.metadata()?;
-            Ok(Self::Unix {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            })
-        }
-
-        #[cfg(windows)]
-        {
-            let _ = handle;
-            let (volume, file) = fsutil::high_resolution_identity(path)?;
-            Ok(Self::Windows { volume, file })
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = (path, handle);
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "filesystem directory identity is unavailable on this platform",
-            ))
-        }
-    }
-}
-
-/// A directory the engine created, with its identity and handle retained.
-/// The retained handle helps prevent identity reuse while the generator runs.
-#[derive(Debug)]
-struct CreatedDirectory {
-    path: PathBuf,
-    identity: DirectoryIdentity,
-    _handle: fs::File,
-}
-
 /// A directory the engine could not create or safely identify.
 #[derive(Debug)]
 struct DirectoryError {
-    /// The directory the engine tried to create.
     directory: PathBuf,
-    /// The cause: what the operating system said.
     cause: io::Error,
-    /// Directories created by this attempt that rollback could not remove.
     rollback: Vec<(PathBuf, io::Error)>,
 }
 
 impl DirectoryError {
-    /// Describes every directory left behind by a failed rollback.
     fn rollback_message(&self, root: &Path) -> String {
         if self.rollback.is_empty() {
             return String::new();
@@ -537,324 +530,103 @@ impl DirectoryError {
     }
 }
 
-/// Captures the identity immediately after creation. Unix reads dev/inode from
-/// the retained handle, but directory creation returns no handle: a replacement
-/// between creation and opening may be recorded as the candidate. Windows
-/// obtains a high-resolution ID by pathname; a replacement during that initial
-/// identity capture is also a narrow, accepted race.
-fn capture_created_directory(path: &Path) -> io::Result<CreatedDirectory> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_dir() {
-        return Err(io::Error::other(
-            "the created path is no longer a directory",
-        ));
-    }
-    let handle = open_directory(path)?;
-    if !handle.metadata()?.is_dir() {
-        return Err(io::Error::other(
-            "the created path changed while its identity was captured",
-        ));
-    }
-    let identity = DirectoryIdentity::capture(path, &handle)?;
-    Ok(CreatedDirectory {
-        path: path.to_path_buf(),
-        identity,
-        _handle: handle,
-    })
-}
-
-/// Opens a directory handle, including on Windows where backup semantics are needed.
-fn open_directory(path: &Path) -> io::Result<fs::File> {
-    #[cfg(unix)]
-    {
-        fs::File::open(path)
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // FILE_FLAG_BACKUP_SEMANTICS permits opening a directory handle.
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        fs::OpenOptions::new()
-            .access_mode(0)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(path)
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = path;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "directory handles are unavailable on this platform",
-        ))
-    }
-}
-
-/// Validates a directory name through the path resolver before creating it.
-fn validate_directory_candidate(root: &Path, candidate: &Path) -> io::Result<()> {
-    let relative = path::relative_to(&path::canonical_root(root), candidate)
-        .or_else(|| path::relative_to(root, candidate))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the directory candidate is not repository-relative",
-            )
-        })?;
-    let resolved = path::inside_repository(root, &relative).map_err(|refusal| {
-        io::Error::other(refusal.message(
-            "the directory candidate",
-            "must lie inside the repository root",
-        ))
-    })?;
-    if !path::inside_root_directory(root, &resolved) {
-        return Err(io::Error::other(
-            "the directory candidate resolves to the repository root",
-        ));
-    }
-    Ok(())
-}
-
-/// Confirms that the current path still identifies the directory created by
-/// the engine. `false` means it is already gone; errors mean it changed or
-/// cannot be identified safely.
-fn verify_created_directory_identity(directory: &CreatedDirectory) -> io::Result<bool> {
-    #[cfg(any(unix, windows))]
-    {
-        let metadata = match fs::symlink_metadata(&directory.path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        if !metadata.file_type().is_dir() {
-            return Err(io::Error::other(
-                "the created path is no longer a directory; refusing cleanup",
-            ));
-        }
-        let handle = open_directory(&directory.path)?;
-        if !handle.metadata()?.is_dir() {
-            return Err(io::Error::other(
-                "the created path is no longer a directory; refusing cleanup",
-            ));
-        }
-        let identity = DirectoryIdentity::capture(&directory.path, &handle)?;
-        if identity != directory.identity {
-            return Err(io::Error::other(
-                "the directory identity changed; refusing cleanup",
-            ));
-        }
-        Ok(true)
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = directory;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "filesystem directory identity is unavailable on this platform",
-        ))
-    }
-}
-
-/// Confirms identity and that the current path remains inside the repository.
-/// `None` means it is already gone.
-fn verify_created_directory(
-    root: &Path,
-    directory: &CreatedDirectory,
-) -> io::Result<Option<PathBuf>> {
-    if !verify_created_directory_identity(directory)? {
-        return Ok(None);
-    }
-    match fs::canonicalize(&directory.path) {
-        Ok(canonical) if path::inside_root_directory(root, &canonical) => Ok(Some(canonical)),
-        Ok(_) => Err(io::Error::other(
-            "the directory resolves outside the repository root; refusing cleanup",
-        )),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-/// Removes one tracked directory only if it is still the same filesystem
-/// object and remains inside the repository. The final identity and containment
-/// check is immediately before pathname removal. Portable pathname APIs cannot
-/// make those checks and removal atomic, so a replacement in that narrow
-/// interval may still be removed.
-fn remove_created_directory(root: &Path, directory: &CreatedDirectory) -> io::Result<()> {
-    remove_created_directory_with(root, directory, || {})
-}
-
-fn remove_created_directory_with<F>(
-    root: &Path,
-    directory: &CreatedDirectory,
-    before_final_validation: F,
-) -> io::Result<()>
-where
-    F: FnOnce(),
-{
-    if verify_created_directory(root, directory)?.is_none() {
-        return Ok(());
-    }
-    before_final_validation();
-    if verify_created_directory(root, directory)?.is_none() {
-        return Ok(());
-    }
-    fs::remove_dir(&directory.path)
-}
-
-/// Removes tracked empty directories, leaving non-empty or replaced paths alone.
-fn remove_created_empty_directories<'a>(
-    root: &Path,
-    directories: impl IntoIterator<Item = &'a CreatedDirectory>,
-) -> Vec<(PathBuf, io::Error)> {
-    let mut failures = Vec::new();
-    for directory in directories {
-        match verify_created_directory(root, directory) {
-            Ok(None) => continue,
-            Err(error) => {
-                failures.push((directory.path.clone(), error));
-                continue;
-            }
-            Ok(Some(_)) => {}
-        }
-
-        match fs::read_dir(&directory.path) {
-            Ok(mut entries) => match entries.next() {
-                None => {
-                    if let Err(error) = remove_created_directory(root, directory) {
-                        if error.kind() != io::ErrorKind::NotFound {
-                            failures.push((directory.path.clone(), error));
-                        }
-                    }
-                }
-                Some(Ok(_)) => {
-                    if let Err(error) = verify_created_directory(root, directory) {
-                        failures.push((directory.path.clone(), error));
-                    }
-                }
-                Some(Err(error)) => failures.push((directory.path.clone(), error)),
-            },
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => failures.push((directory.path.clone(), error)),
-        }
-    }
-    failures
-}
-
-/// Creates the directories the generated file needs.
-///
-/// The **union** of two sets of directories, and both of them are needed:
-///
-/// * the **missing directories of the named traversal**: the directories the
-///   operating system walks to reach the file.  A `..` can only pop a
-///   directory that exists, so `sub/../x.md` needs `sub` — even though the
-///   file itself lands in the root;
-/// * the **directory the path resolves to**: the place the operating system
-///   puts the file.  A link in the path leads to its target, and the target
-///   is the place the file lands in.
-///
-/// The missing directories of the traversal are created **as they are named**:
-/// the path the project named is the path the engine walks.  The directory
-/// the path resolves to is created **where the path resolves to** — the place
-/// the system puts the file.
-///
-/// The list that comes back is in cleanup order: the directories below a
-/// directory come before it, so the parent is empty if it can be removed.
+/// Creates directories for both the resolved target and the named traversal.
+/// Every filesystem operation is relative to the retained repository root.
 fn create_directories(
     root: &Path,
+    filesystem: &RootDir,
     relative: &str,
     resolved: &Path,
-) -> Result<Vec<CreatedDirectory>, DirectoryError> {
-    create_directories_with(root, relative, resolved, |directory| {
-        fs::create_dir(directory)
-    })
+) -> Result<Vec<TrackedDir>, DirectoryError> {
+    create_directories_with(
+        root,
+        filesystem,
+        relative,
+        resolved,
+        |filesystem, candidate| filesystem.create_dir(candidate),
+    )
 }
 
 fn create_directories_with<F>(
     root: &Path,
-    relative: &str,
-    resolved: &Path,
-    create: F,
-) -> Result<Vec<CreatedDirectory>, DirectoryError>
-where
-    F: FnMut(&Path) -> io::Result<()>,
-{
-    create_directories_with_capture(root, relative, resolved, create, capture_created_directory)
-}
-
-fn create_directories_with_capture<F, C>(
-    root: &Path,
+    filesystem: &RootDir,
     relative: &str,
     resolved: &Path,
     mut create: F,
-    mut capture: C,
-) -> Result<Vec<CreatedDirectory>, DirectoryError>
+) -> Result<Vec<TrackedDir>, DirectoryError>
 where
-    F: FnMut(&Path) -> io::Result<()>,
-    C: FnMut(&Path) -> io::Result<CreatedDirectory>,
+    F: FnMut(&RootDir, &Path) -> io::Result<()>,
 {
-    let mut created = Vec::new();
     let mut directories = Vec::new();
-
-    // 1. the directory the path resolves to. It has to lie strictly inside
-    //    the repository root. The root itself exists — there is nothing to
-    //    create.
-    if let Some(directory) = resolved.parent() {
-        if path::inside_root_directory(root, directory) {
-            directories.push(directory.to_path_buf());
+    if let Some(parent) = resolved.parent() {
+        if path::inside_root_directory(root, parent) {
+            if let Ok(parent) = filesystem.relative(parent) {
+                directories.push((parent, None));
+            }
+        }
+    }
+    match traversal_directories(root, filesystem, relative) {
+        Ok(traversal) => directories.extend(
+            traversal
+                .into_iter()
+                .map(|(candidate, alias)| (candidate, Some(alias))),
+        ),
+        Err((directory, cause)) => {
+            return Err(DirectoryError {
+                directory,
+                cause,
+                rollback: Vec::new(),
+            });
         }
     }
 
-    // 2. the missing directories of the named traversal.  They come after
-    //    the resolved directory: a link in the path is only a directory when
-    //    its target exists.
-    directories.extend(traversal_directories(root, relative));
-    for directory in directories {
-        if directory.is_dir() {
-            // The system walks into it: there is nothing to create.
-            continue;
-        }
-        if path::is_link(&directory) {
-            // A link is not the engine's to create: the system walks into
-            // its target, and the resolved directory above has created it.
-            continue;
-        }
-        let missing = fsutil::missing_directories(&directory);
-        // `missing_directories` is deepest-first. Create each parent before
-        // its child so the successful creations can be rolled back exactly.
-        // An empty result means an existing non-directory (normally a file):
-        // attempting to create it preserves the operating system's error.
-        let candidates = if missing.is_empty() {
+    let mut created = Vec::new();
+    for (directory, alias) in directories {
+        let missing = missing_directories(filesystem, &directory);
+        let candidates: Vec<PathBuf> = if missing.is_empty() {
             vec![directory.clone()]
         } else {
             missing.into_iter().rev().collect()
         };
         for candidate in candidates {
-            // Resolve each name through the same path authority before the
-            // syscall. A concurrent link swap can still race this check; the
-            // post-create check then reports the new path as left in place.
-            if let Err(cause) = validate_directory_candidate(root, &candidate) {
-                let rollback = rollback_directories(root, &created);
+            if let Err(cause) = validate_directory_candidate(root, filesystem, &candidate) {
+                let rollback = rollback_directories(filesystem, &mut created);
                 return Err(DirectoryError {
                     directory: candidate,
                     cause,
                     rollback,
                 });
             }
-            match create(&candidate) {
-                Ok(()) => {
-                    let directory = match capture(&candidate) {
-                        Ok(directory) => directory,
-                        Err(cause) => {
-                            return Err(post_creation_directory_error(
-                                root, &candidate, &created, cause,
-                            ));
+            if candidate == directory {
+                if let Some(alias) = &alias {
+                    if let Err(cause) =
+                        validate_traversal_alias(root, filesystem, alias, &candidate)
+                    {
+                        let rollback = rollback_directories(filesystem, &mut created);
+                        return Err(DirectoryError {
+                            directory: candidate,
+                            cause,
+                            rollback,
+                        });
+                    }
+                }
+            }
+            match create(filesystem, &candidate) {
+                Ok(()) => match filesystem.track_dir(&candidate) {
+                    Ok(tracked) => match filesystem.verify_tracked_dir(&tracked).and_then(|valid| {
+                        if !valid {
+                            return Ok(false);
                         }
-                    };
-                    match verify_created_directory(root, &directory) {
-                        Ok(Some(_)) => created.push(directory),
-                        Ok(None) => {
-                            let rollback = rollback_directories(root, &created);
+                        if candidate == directory {
+                            if let Some(alias) = &alias {
+                                validate_traversal_alias(root, filesystem, alias, &candidate)?;
+                            }
+                        }
+                        Ok(true)
+                    }) {
+                        Ok(true) => created.push(tracked),
+                        Ok(false) => {
+                            let rollback = rollback_directories(filesystem, &mut created);
                             return Err(DirectoryError {
                                 directory: candidate,
                                 cause: io::Error::other(
@@ -865,18 +637,30 @@ where
                         }
                         Err(cause) => {
                             return Err(post_creation_directory_error(
-                                root, &candidate, &created, cause,
+                                filesystem,
+                                &candidate,
+                                &mut created,
+                                cause,
                             ));
                         }
+                    },
+                    Err(cause) => {
+                        return Err(post_creation_directory_error(
+                            filesystem,
+                            &candidate,
+                            &mut created,
+                            cause,
+                        ));
                     }
-                }
+                },
                 Err(cause)
-                    if cause.kind() == io::ErrorKind::AlreadyExists && candidate.is_dir() =>
+                    if cause.kind() == io::ErrorKind::AlreadyExists
+                        && filesystem
+                            .metadata(&candidate)
+                            .is_ok_and(|metadata| metadata.is_dir()) =>
                 {
-                    // Another process made the directory after the missing
-                    // path was inspected. It is usable, but not ours to remove.
-                    if let Err(cause) = validate_directory_candidate(root, &candidate) {
-                        let rollback = rollback_directories(root, &created);
+                    if let Err(cause) = validate_directory_candidate(root, filesystem, &candidate) {
+                        let rollback = rollback_directories(filesystem, &mut created);
                         return Err(DirectoryError {
                             directory: candidate,
                             cause,
@@ -885,7 +669,7 @@ where
                     }
                 }
                 Err(cause) => {
-                    let rollback = rollback_directories(root, &created);
+                    let rollback = rollback_directories(filesystem, &mut created);
                     return Err(DirectoryError {
                         directory: candidate,
                         cause,
@@ -895,35 +679,149 @@ where
             }
         }
     }
-
-    // The creation order has parents before children; removal is its reverse.
     created.reverse();
     Ok(created)
 }
 
-/// Attempts rollback of every directory created by a failed attempt, deepest first.
-fn rollback_directories(root: &Path, created: &[CreatedDirectory]) -> Vec<(PathBuf, io::Error)> {
+fn missing_directories(filesystem: &RootDir, directory: &Path) -> Vec<PathBuf> {
+    let mut missing = Vec::new();
+    let mut current = Some(directory);
+    while let Some(candidate) = current {
+        if candidate.as_os_str().is_empty() || candidate == Path::new(".") {
+            break;
+        }
+        match filesystem.metadata(candidate) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => break,
+            Err(_) => missing.push(candidate.to_path_buf()),
+        }
+        current = candidate.parent();
+    }
+    missing
+}
+
+fn validate_directory_candidate(
+    root: &Path,
+    filesystem: &RootDir,
+    candidate: &Path,
+) -> io::Result<()> {
+    let resolved =
+        path::inside_repository(root, &candidate.to_string_lossy()).map_err(|refusal| {
+            io::Error::other(refusal.message(
+                "the directory candidate",
+                "must lie inside the repository root",
+            ))
+        })?;
+    if filesystem.relative(&resolved)? != candidate {
+        return Err(io::Error::other(
+            "the directory candidate changed or resolves through a symbolic link",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_traversal_alias(
+    root: &Path,
+    filesystem: &RootDir,
+    alias: &str,
+    candidate: &Path,
+) -> io::Result<()> {
+    let resolved = path::inside_repository(root, alias).map_err(|refusal| {
+        io::Error::other(refusal.message(
+            "the directory candidate",
+            "must lie inside the repository root",
+        ))
+    })?;
+    if filesystem.relative(&resolved)? != candidate {
+        return Err(io::Error::other(
+            "the named traversal changed or resolves outside the repository root",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_created_directory_identity(
+    filesystem: &RootDir,
+    directory: &TrackedDir,
+) -> io::Result<bool> {
+    filesystem.verify_tracked_dir(directory)
+}
+
+fn remove_created_directory(filesystem: &RootDir, directory: &mut TrackedDir) -> io::Result<()> {
+    if !filesystem.verify_tracked_dir(directory)? {
+        return Ok(());
+    }
+    if !filesystem.remove_tracked_dir(directory)? {
+        return Err(io::Error::new(
+            io::ErrorKind::DirectoryNotEmpty,
+            "the created directory is not empty",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn remove_created_directory_with<F>(
+    filesystem: &RootDir,
+    directory: &mut TrackedDir,
+    before_final_validation: F,
+) -> io::Result<()>
+where
+    F: FnOnce(),
+{
+    if !filesystem.verify_tracked_dir(directory)? {
+        return Ok(());
+    }
+    before_final_validation();
+    remove_created_directory(filesystem, directory)
+}
+
+fn remove_created_empty_directories(
+    filesystem: &RootDir,
+    directories: &mut [TrackedDir],
+) -> Vec<(PathBuf, io::Error)> {
     let mut failures = Vec::new();
-    for directory in created.iter().rev() {
-        if let Err(error) = remove_created_directory(root, directory) {
+    for directory in directories {
+        match verify_created_directory_identity(filesystem, directory) {
+            Ok(false) => continue,
+            Err(error) => {
+                failures.push((directory.path().to_path_buf(), error));
+                continue;
+            }
+            Ok(true) => {}
+        }
+        match filesystem.remove_tracked_dir(directory) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => failures.push((directory.path().to_path_buf(), error)),
+        }
+    }
+    failures
+}
+
+fn rollback_directories(
+    filesystem: &RootDir,
+    created: &mut [TrackedDir],
+) -> Vec<(PathBuf, io::Error)> {
+    let mut failures = Vec::new();
+    for directory in created.iter_mut().rev() {
+        if let Err(error) = remove_created_directory(filesystem, directory) {
             if error.kind() != io::ErrorKind::NotFound {
-                failures.push((directory.path.clone(), error));
+                failures.push((directory.path().to_path_buf(), error));
             }
         }
     }
     failures
 }
 
-/// Reports a candidate created by the engine but rejected by post-create
-/// identity or containment validation. It is never removed by name alone.
 fn post_creation_directory_error(
-    root: &Path,
+    filesystem: &RootDir,
     candidate: &Path,
-    created: &[CreatedDirectory],
+    created: &mut [TrackedDir],
     cause: io::Error,
 ) -> DirectoryError {
-    let mut rollback = rollback_directories(root, created);
-    match fs::symlink_metadata(candidate) {
+    let mut rollback = rollback_directories(filesystem, created);
+    match filesystem.symlink_metadata(candidate) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Ok(_) => rollback.push((
             candidate.to_path_buf(),
@@ -946,47 +844,51 @@ fn post_creation_directory_error(
     }
 }
 
-/// The directories the operating system walks to reach the file.
-///
-/// Every component of the named path but the last is a directory the system
-/// walks into: a `..` pops the prefix, and the directory it pops is the one
-/// before it.
-///
-/// The directories are **as the path names them**: the engine walks the path
-/// the project named.
-fn traversal_directories(root: &Path, relative: &str) -> Vec<PathBuf> {
+fn traversal_directories(
+    root: &Path,
+    filesystem: &RootDir,
+    relative: &str,
+) -> Result<Vec<(PathBuf, String)>, (PathBuf, io::Error)> {
     let components: Vec<Component<'_>> = Path::new(relative).components().collect();
     let mut prefix = PathBuf::new();
     let mut directories = Vec::new();
     for (index, component) in components.iter().enumerate() {
         match component {
-            Component::Normal(name) => {
-                prefix.push(name);
-                // The last component is the file itself.
-                if index + 1 < components.len() {
-                    directories.push(root.join(&prefix));
-                }
-            }
-            // A `..` pops the prefix: the path goes up again.
+            Component::Normal(name) => prefix.push(name),
             Component::ParentDir => {
                 prefix.pop();
             }
             Component::CurDir => {}
             _ => {}
         }
+        if index + 1 < components.len() {
+            let alias = prefix.to_string_lossy().into_owned();
+            let resolved = path::inside_repository(root, &alias).map_err(|refusal| {
+                (
+                    PathBuf::from(&alias),
+                    io::Error::other(refusal.message(
+                        "the directory candidate",
+                        "must lie inside the repository root",
+                    )),
+                )
+            })?;
+            let relative = filesystem
+                .relative(&resolved)
+                .map_err(|error| (PathBuf::from(&alias), error))?;
+            if relative != Path::new(".") {
+                directories.push((relative, alias));
+            }
+        }
     }
-    directories
+    Ok(directories)
 }
 
-/// The name of a directory in an error: the path relative to the repository
-/// root.
-///
-/// The directory is named as it was created: the resolved one as the system
-/// resolves it, the named one as the project named it.
 fn directory_name(root: &Path, directory: &Path) -> String {
-    path::relative_to(&path::canonical_root(root), directory)
-        .or_else(|| path::relative_to(root, directory))
-        .unwrap_or_else(|| path::file_name(directory))
+    if directory.is_absolute() {
+        path::relative_to(root, directory).unwrap_or_else(|| path::file_name(directory))
+    } else {
+        directory.to_string_lossy().replace('\\', "/")
+    }
 }
 
 /// Writes the produced content into the generated file.
@@ -995,44 +897,32 @@ fn directory_name(root: &Path, directory: &Path) -> String {
 /// generated files, nothing else.
 fn write_fixed(
     root: &Path,
+    filesystem: &RootDir,
     target: &Path,
     relative: &str,
-    resolved: &Path,
     produced: &[u8],
 ) -> Result<(), Error> {
-    let display = path::display(Some(root), target);
-    if target.exists() {
+    let display = path::display(Some(root), &root.join(relative));
+    if filesystem.metadata(target).is_ok() {
         // Writing in place keeps the mode of the file.
-        fs::write(target, produced)
+        filesystem
+            .write(target, produced)
             .map_err(|error| Error::new(format!("cannot write {display}: {error}")))?;
         return Ok(());
     }
-    // The directories the file needs are created: the engine's business, not
-    // the generator's.  The write follows the link, and the file lands
-    // behind it.
-    let created = create_directories(root, relative, resolved).map_err(|error| {
-        Error::new(format!(
-            "cannot write {display}: cannot create the directory {}: {}{}",
-            directory_name(root, &error.directory),
-            error.cause,
-            error.rollback_message(root)
-        ))
-    })?;
-    if let Err(error) = fs::write(target, produced) {
-        let cleanup = cleanup_fix_directories(root, &created, resolved);
-        let message = match cleanup {
-            Ok(()) => format!("cannot write {display}: {error}"),
-            Err(cleanup) => format!(
-                "cannot write {display}: {error}; {cleanup} — the working tree was modified"
-            ),
-        };
-        return Err(Error::new(message));
+    // A temporary-output generator never needs to traverse the configured
+    // spelling; it writes the already-resolved in-root target directly.
+    if let Some(parent) = target.parent() {
+        filesystem.create_dir_all(parent).map_err(|error| {
+            let directory = path::display(Some(root), &root.join(parent));
+            Error::new(format!(
+                "cannot write {display}: cannot create the directory {directory}: {error}"
+            ))
+        })?;
     }
-    cleanup_fix_directories(root, &created, resolved).map_err(|error| {
-        Error::new(format!(
-            "cannot finish fixing {display}: {error} — the working tree was modified"
-        ))
-    })
+    filesystem
+        .write(target, produced)
+        .map_err(|error| Error::new(format!("cannot write {display}: {error}")))
 }
 
 /// Attempts cleanup of empty directories created only to walk the named path.
@@ -1042,34 +932,34 @@ fn write_fixed(
 /// traversal that reaches one of those parents through an in-root link.
 fn cleanup_fix_directories(
     root: &Path,
-    created: &[CreatedDirectory],
+    filesystem: &RootDir,
+    created: &mut [TrackedDir],
     resolved: &Path,
 ) -> Result<(), String> {
-    let resolved_parent = resolved.parent().unwrap_or(root);
-    let canonical_root = path::canonical_root(root);
-    let mut traversal_only: Vec<&CreatedDirectory> = Vec::new();
+    let resolved_parent = resolved
+        .parent()
+        .and_then(|parent| filesystem.relative(parent).ok())
+        .unwrap_or_else(|| PathBuf::from("."));
     let mut failures = Vec::new();
     for directory in created {
-        match verify_created_directory(root, directory) {
-            Ok(None) => continue,
+        if resolved_parent.starts_with(directory.path()) {
+            // The target's parent chain is required to keep the generated file.
+            continue;
+        }
+        match verify_created_directory_identity(filesystem, directory) {
+            Ok(false) => continue,
             Err(error) => {
-                failures.push((directory.path.clone(), error));
+                failures.push((directory.path().to_path_buf(), error));
                 continue;
             }
-            Ok(Some(canonical)) if canonical != canonical_root => {
-                if !resolved_parent.starts_with(&canonical) {
-                    traversal_only.push(directory);
-                }
-            }
-            // The repository root and the resolved target's parent chain are
-            // required to keep the generated file in place.
-            Ok(Some(_)) => {}
+            Ok(true) => {}
+        }
+        match filesystem.remove_tracked_dir(directory) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => failures.push((directory.path().to_path_buf(), error)),
         }
     }
-    failures.extend(remove_created_empty_directories(
-        root,
-        traversal_only.iter().copied(),
-    ));
     if failures.is_empty() {
         return Ok(());
     }
@@ -1136,50 +1026,33 @@ fn run_generator(
     Ok(())
 }
 
-/// The snapshot of a generated file: its bytes, its mode and the directories
-/// around it.
+/// The snapshot of a generated file: its bytes, mode, time, and directories.
 struct Snapshot {
-    /// The path of the generated file.
+    /// The resolved repository-relative target written by the generator.
     target: PathBuf,
-    /// The original bytes, if the file existed.
     content: Option<Vec<u8>>,
-    /// The time the file was written last, if it existed.
     modified: Option<SystemTime>,
-    /// The inode of the file, on the platforms that have one.
-    ///
-    /// The inode survives a preserved time: a generator that replaces the
-    /// file leaves a new one behind.
     inode: Option<u64>,
-    /// The original mode, on the platforms that have one.
     mode: Option<u32>,
-    /// The symbolic link the target pointed to, if it was one.
     link: Option<Link>,
-    /// The directories the engine created for the file.
-    ///
-    /// The list is in cleanup order: children come before parents.
-    created: Vec<CreatedDirectory>,
+    /// Engine-created directories, in child-before-parent cleanup order.
+    created: Vec<TrackedDir>,
 }
 
-/// The symbolic link a generated file pointed to.
+/// The symbolic link at the configured path, and the in-root path it resolves to.
 struct Link {
-    /// The raw target of the link.
+    path: PathBuf,
     raw: PathBuf,
-    /// The path of the file the link points to.
     resolved: PathBuf,
-    /// The bytes of that file, if it existed.
     content: Option<Vec<u8>>,
-    /// The time that file was written last, if it existed.
     modified: Option<SystemTime>,
-    /// The inode of that file, on the platforms that have one.
     inode: Option<u64>,
-    /// The mode of that file, on the platforms that have one.
     mode: Option<u32>,
 }
 
 impl Snapshot {
-    /// Takes the snapshot of `target`.
-    fn take(target: &Path) -> io::Result<Self> {
-        match fs::symlink_metadata(target) {
+    fn take(filesystem: &RootDir, target: &Path, named_target: &Path) -> io::Result<Self> {
+        match filesystem.symlink_metadata(named_target) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Snapshot {
                 target: target.to_path_buf(),
                 content: None,
@@ -1190,17 +1063,14 @@ impl Snapshot {
                 created: Vec::new(),
             }),
             Err(error) => Err(error),
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                let raw = fs::read_link(target)?;
-                let resolved = resolve(target, &raw);
-                let (content, modified, inode, mode) = match fs::metadata(&resolved) {
-                    Ok(metadata) => (
-                        Some(fs::read(&resolved)?),
-                        metadata.modified().ok(),
-                        fsutil::inode_of(&metadata),
-                        fsutil::mode_of(&metadata),
-                    ),
-                    Err(_) => (None, None, None, None),
+            Ok(metadata) if metadata.is_symlink() => {
+                let raw = filesystem.read_link(named_target)?;
+                let state = read_file_state(filesystem, target)?;
+                let (content, modified, inode, mode) = match state {
+                    Some((content, modified, inode, mode)) => {
+                        (Some(content), modified, inode, mode)
+                    }
+                    None => (None, None, None, None),
                 };
                 Ok(Snapshot {
                     target: target.to_path_buf(),
@@ -1209,8 +1079,9 @@ impl Snapshot {
                     inode: None,
                     mode: None,
                     link: Some(Link {
+                        path: named_target.to_path_buf(),
                         raw,
-                        resolved,
+                        resolved: target.to_path_buf(),
                         content,
                         modified,
                         inode,
@@ -1219,51 +1090,70 @@ impl Snapshot {
                     created: Vec::new(),
                 })
             }
-            Ok(metadata) => Ok(Snapshot {
-                target: target.to_path_buf(),
-                content: Some(fs::read(target)?),
-                modified: metadata.modified().ok(),
-                inode: fsutil::inode_of(&metadata),
-                mode: fsutil::mode_of(&metadata),
-                link: None,
-                created: Vec::new(),
-            }),
+            Ok(_) => {
+                let state = read_file_state(filesystem, target)?.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "the generated file is missing")
+                })?;
+                let (content, modified, inode, mode) = state;
+                Ok(Snapshot {
+                    target: target.to_path_buf(),
+                    content: Some(content),
+                    modified,
+                    inode,
+                    mode,
+                    link: None,
+                    created: Vec::new(),
+                })
+            }
         }
     }
 
-    /// True when the file was written since the snapshot.
-    ///
-    /// The bytes and the time are both compared: a generator that rewrites
-    /// the same bytes updates the time, and a generator that leaves the file
-    /// alone updates neither.  Without the time the engine could not tell
-    /// "the generator produced this" from "the generator did not run".
-    ///
-    /// The time is compared with the **marker**: the engine touched the file
-    /// with a time far enough in the past before the generator ran, so a
-    /// current time means the generator wrote the file — on every
-    /// filesystem, whatever its timestamp granularity is.
-    fn was_written(&self, target: &Path, produced: Option<&[u8]>, marker: SystemTime) -> bool {
-        let Ok(metadata) = fs::metadata(target) else {
+    /// True when the generator wrote the file after the marker was set.
+    fn was_written(
+        &self,
+        filesystem: &RootDir,
+        produced: Option<&[u8]>,
+        marker: SystemTime,
+    ) -> bool {
+        if self
+            .link
+            .as_ref()
+            .is_some_and(|link| !link_is_unchanged(filesystem, link))
+        {
+            return true;
+        }
+        let current = self
+            .link
+            .as_ref()
+            .map(|link| link.resolved.as_path())
+            .unwrap_or(&self.target);
+        let Ok(file) = filesystem.open_file(current) else {
+            return false;
+        };
+        let Ok(metadata) = file.metadata() else {
             return false;
         };
         let Some(before) = self.modified() else {
-            // The file did not exist before: it exists now, so it was written.
             return true;
         };
         let now = metadata.modified().ok();
         if now != Some(before) && now != Some(marker) {
             return true;
         }
-        // The time is the same — but a generator that **replaces** the file
-        // (`cp -p` and `mv`, the reproducible-build pattern) leaves a new
-        // inode behind, and the inode survives a preserved time.
         if fsutil::inode_of(&metadata) != self.inode() {
             return true;
         }
         produced != self.bytes()
     }
 
-    /// The bytes of the file behind the target, if it existed.
+    fn read_current(&self, filesystem: &RootDir) -> io::Result<Vec<u8>> {
+        match &self.link {
+            Some(link) if link_is_unchanged(filesystem, link) => filesystem.read(&link.resolved),
+            Some(link) => filesystem.read(&link.path),
+            None => filesystem.read(&self.target),
+        }
+    }
+
     fn bytes(&self) -> Option<&[u8]> {
         match &self.link {
             Some(link) => link.content.as_deref(),
@@ -1271,7 +1161,6 @@ impl Snapshot {
         }
     }
 
-    /// The time the file behind the target was written last, if it existed.
     fn modified(&self) -> Option<SystemTime> {
         match &self.link {
             Some(link) => link.modified,
@@ -1279,7 +1168,6 @@ impl Snapshot {
         }
     }
 
-    /// The inode of the file behind the target, if it existed.
     fn inode(&self) -> Option<u64> {
         match &self.link {
             Some(link) => link.inode,
@@ -1287,22 +1175,23 @@ impl Snapshot {
         }
     }
 
-    /// Restores the snapshot and verifies the restore.
-    fn restore(&self, root: &Path) -> Result<(), String> {
-        self.restore_with(root, || self.restore_file())?;
-        self.verify()
+    fn restore(&mut self, root: &Path, filesystem: &RootDir) -> Result<(), String> {
+        let restored = self.restore_file(filesystem);
+        self.restore_with(root, filesystem, || restored)?;
+        self.verify(filesystem)
     }
 
-    /// Runs file restoration and always attempts directory cleanup.
-    ///
-    /// Kept separate so a file-restore failure can be tested deterministically
-    /// without relying on filesystem permissions.
-    fn restore_with<F>(&self, root: &Path, restore_file: F) -> Result<(), String>
+    fn restore_with<F>(
+        &mut self,
+        root: &Path,
+        filesystem: &RootDir,
+        restore_file: F,
+    ) -> Result<(), String>
     where
         F: FnOnce() -> Result<(), String>,
     {
         let restored = restore_file();
-        let cleaned = self.remove_created_directories(root);
+        let cleaned = self.remove_created_directories(root, filesystem);
         match (restored, cleaned) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(restore), Ok(())) => Err(format!("file restoration failed: {restore}")),
@@ -1313,33 +1202,32 @@ impl Snapshot {
         }
     }
 
-    /// Restores the file or symbolic link without cleaning up its directories.
-    fn restore_file(&self) -> Result<(), String> {
+    fn restore_file(&self, filesystem: &RootDir) -> Result<(), String> {
         match &self.link {
             Some(link) => {
-                // The file the link pointed to: the generator may have written
-                // through the link, and the restore undoes that.  The rename
-                // replaces that file, it never writes through the link.
-                //
-                // The link itself is recreated: a rename over the link would
-                // replace it with a regular file and change the tree — and the
-                // tree must not change (SPEC 7).
                 if let Some(content) = &link.content {
-                    fsutil::write_atomic(&link.resolved, content, link.mode, link.modified)
+                    filesystem
+                        .write_atomic(&link.resolved, content, link.mode, link.modified)
                         .map_err(|error| error.to_string())?;
                 }
-                remove_path(&self.target).map_err(|error| error.to_string())?;
-                create_symlink(&link.raw, &self.target).map_err(|error| error.to_string())?;
+                if !link_is_unchanged(filesystem, link) {
+                    filesystem
+                        .remove_file(&link.path)
+                        .map_err(|error| error.to_string())?;
+                    filesystem
+                        .create_symlink(&link.raw, &link.path)
+                        .map_err(|error| error.to_string())?;
+                }
             }
             None => match &self.content {
-                Some(content) => {
-                    fsutil::write_atomic(&self.target, content, self.mode, self.modified)
-                        .map_err(|error| error.to_string())?
-                }
+                Some(content) => filesystem
+                    .write_atomic(&self.target, content, self.mode, self.modified)
+                    .map_err(|error| error.to_string())?,
                 None => {
-                    // The file did not exist before: the generator created it.
-                    if fs::symlink_metadata(&self.target).is_ok() {
-                        fs::remove_file(&self.target).map_err(|error| error.to_string())?;
+                    if filesystem.symlink_metadata(&self.target).is_ok() {
+                        filesystem
+                            .remove_file(&self.target)
+                            .map_err(|error| error.to_string())?;
                     }
                 }
             },
@@ -1347,14 +1235,9 @@ impl Snapshot {
         Ok(())
     }
 
-    /// Keeps the produced content, restores its mode, and cleans traversal dirs.
-    ///
-    /// This is what `--fix` asks for: the content of the generated file is
-    /// the produced one, required resolved parents remain, and everything else
-    /// stays as it was.
-    fn keep(&self, root: &Path, resolved: &Path) -> Result<(), String> {
-        let kept = self.keep_mode();
-        let cleaned = cleanup_fix_directories(root, &self.created, resolved);
+    fn keep(&mut self, root: &Path, resolved: &Path, filesystem: &RootDir) -> Result<(), String> {
+        let kept = self.keep_mode(filesystem);
+        let cleaned = cleanup_fix_directories(root, filesystem, &mut self.created, resolved);
         match (kept, cleaned) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(keep), Ok(())) => Err(keep),
@@ -1363,20 +1246,26 @@ impl Snapshot {
         }
     }
 
-    /// Restores the file mode while keeping the produced content.
-    fn keep_mode(&self) -> Result<(), String> {
+    fn keep_mode(&self, filesystem: &RootDir) -> Result<(), String> {
         if let (Some(mode), None) = (self.mode, &self.link) {
-            let metadata = fs::metadata(&self.target).map_err(|error| error.to_string())?;
-            if fsutil::mode_of(&metadata) != Some(mode) {
-                fsutil::set_mode(&self.target, mode).map_err(|error| error.to_string())?;
+            let file = filesystem
+                .open_file(&self.target)
+                .map_err(|error| error.to_string())?;
+            if fsutil::mode_of(&file.metadata().map_err(|error| error.to_string())?) != Some(mode) {
+                filesystem
+                    .set_mode(&self.target, mode)
+                    .map_err(|error| error.to_string())?;
             }
         }
         Ok(())
     }
 
-    /// Removes the directories the engine created and left empty.
-    fn remove_created_directories(&self, root: &Path) -> Result<(), String> {
-        let failures = remove_created_empty_directories(root, &self.created);
+    fn remove_created_directories(
+        &mut self,
+        root: &Path,
+        filesystem: &RootDir,
+    ) -> Result<(), String> {
+        let failures = remove_created_empty_directories(filesystem, &mut self.created);
         if failures.is_empty() {
             return Ok(());
         }
@@ -1388,21 +1277,25 @@ impl Snapshot {
         Err(format!("could not remove created directories: {failures}"))
     }
 
-    /// Verifies the restore: the bytes are read back and compared.
-    fn verify(&self) -> Result<(), String> {
+    fn verify(&self, filesystem: &RootDir) -> Result<(), String> {
         match &self.link {
             Some(link) => {
-                let metadata =
-                    fs::symlink_metadata(&self.target).map_err(|error| error.to_string())?;
-                if !metadata.file_type().is_symlink() {
+                let metadata = filesystem
+                    .symlink_metadata(&link.path)
+                    .map_err(|error| error.to_string())?;
+                if !metadata.is_symlink() {
                     return Err("the target is no longer a symbolic link".to_string());
                 }
-                let raw = fs::read_link(&self.target).map_err(|error| error.to_string())?;
+                let raw = filesystem
+                    .read_link(&link.path)
+                    .map_err(|error| error.to_string())?;
                 if raw != link.raw {
                     return Err("the symbolic link points somewhere else".to_string());
                 }
                 if let Some(content) = &link.content {
-                    let read = fs::read(&link.resolved).map_err(|error| error.to_string())?;
+                    let read = filesystem
+                        .read(&link.resolved)
+                        .map_err(|error| error.to_string())?;
                     if &read != content {
                         return Err("the bytes differ from the snapshot".to_string());
                     }
@@ -1411,21 +1304,26 @@ impl Snapshot {
             }
             None => match &self.content {
                 Some(content) => {
-                    let read = fs::read(&self.target).map_err(|error| error.to_string())?;
+                    let read = filesystem
+                        .read(&self.target)
+                        .map_err(|error| error.to_string())?;
                     if &read != content {
                         return Err("the bytes differ from the snapshot".to_string());
                     }
                     if let Some(mode) = self.mode {
-                        let metadata =
-                            fs::metadata(&self.target).map_err(|error| error.to_string())?;
-                        if fsutil::mode_of(&metadata) != Some(mode) {
+                        let file = filesystem
+                            .open_file(&self.target)
+                            .map_err(|error| error.to_string())?;
+                        if fsutil::mode_of(&file.metadata().map_err(|error| error.to_string())?)
+                            != Some(mode)
+                        {
                             return Err("the mode differs from the snapshot".to_string());
                         }
                     }
                     Ok(())
                 }
                 None => {
-                    if fs::symlink_metadata(&self.target).is_ok() {
+                    if filesystem.symlink_metadata(&self.target).is_ok() {
                         Err("the file was not removed".to_string())
                     } else {
                         Ok(())
@@ -1436,91 +1334,105 @@ impl Snapshot {
     }
 }
 
-/// The path a symbolic link points to.
-fn resolve(target: &Path, raw: &Path) -> PathBuf {
-    if path::is_absolute(raw) {
-        path::normalize(raw)
-    } else {
-        let directory = target.parent().unwrap_or_else(|| Path::new("."));
-        path::normalize(&directory.join(raw))
-    }
+fn link_is_unchanged(filesystem: &RootDir, link: &Link) -> bool {
+    filesystem
+        .symlink_metadata(&link.path)
+        .is_ok_and(|metadata| metadata.is_symlink())
+        && filesystem
+            .read_link(&link.path)
+            .is_ok_and(|raw| raw == link.raw)
 }
 
-/// Removes a file or a symbolic link.
-fn remove_path(target: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(target) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-        Ok(metadata) if metadata.is_dir() => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the target is a directory",
-        )),
-        Ok(_) => fs::remove_file(target),
-    }
-}
+type FileState = (Vec<u8>, Option<SystemTime>, Option<u64>, Option<u32>);
 
-/// Creates a symbolic link, on the platforms that have them.
-#[cfg(unix)]
-fn create_symlink(raw: &Path, target: &Path) -> io::Result<()> {
-    std::os::unix::fs::symlink(raw, target)
-}
-
-/// Creates a symbolic link, on the platforms that have none.
-#[cfg(not(unix))]
-fn create_symlink(_raw: &Path, _target: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "symbolic links are not supported here",
-    ))
+fn read_file_state(filesystem: &RootDir, path: &Path) -> io::Result<Option<FileState>> {
+    let mut file = match filesystem.open_file(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut content = Vec::new();
+    file.read_to_end(&mut content)?;
+    let metadata = file.metadata()?;
+    Ok(Some((
+        content,
+        metadata.modified().ok(),
+        fsutil::inode_of(&metadata),
+        fsutil::mode_of(&metadata),
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn filesystem(root: &crate::test_tempdir::TempDir) -> RootDir {
+        RootDir::open(root.path()).expect("the repository capability opens")
+    }
 
     #[cfg(unix)]
     #[test]
     fn restore_failure_still_removes_created_empty_directories() {
         let root = crate::test_tempdir::TempDir::new().expect("a temporary root");
-        let parent = root.path().join("new");
-        let nested = parent.join("nested");
-        fs::create_dir_all(&nested).expect("the directories are created");
+        let filesystem = filesystem(&root);
+        filesystem
+            .create_dir(Path::new("new"))
+            .expect("the parent is created");
+        filesystem
+            .create_dir(Path::new("new/nested"))
+            .expect("the nested directory is created");
         let snapshot = Snapshot {
-            target: nested.join("generated.md"),
+            target: PathBuf::from("new/nested/generated.md"),
             content: None,
             modified: None,
             inode: None,
             mode: None,
             link: None,
             created: vec![
-                capture_created_directory(&nested).expect("the nested directory identity is read"),
-                capture_created_directory(&parent).expect("the parent directory identity is read"),
+                filesystem
+                    .track_dir(Path::new("new/nested"))
+                    .expect("the nested identity is captured"),
+                filesystem
+                    .track_dir(Path::new("new"))
+                    .expect("the parent identity is captured"),
             ],
         };
+        let mut snapshot = snapshot;
 
         let error = snapshot
-            .restore_with(root.path(), || {
+            .restore_with(root.path(), &filesystem, || {
                 Err("injected file restore failure".to_string())
             })
             .expect_err("the injected restoration fails");
 
         assert!(error.contains("injected file restore failure"), "{error}");
-        assert!(!parent.exists(), "the parent directory was left behind");
-        assert!(!nested.exists(), "the nested directory was left behind");
+        assert!(
+            !root.path().join("new").exists(),
+            "the parent was left behind"
+        );
+        assert!(
+            !root.path().join("new/nested").exists(),
+            "the child was left behind"
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn directory_cleanup_failures_name_repository_relative_paths() {
+    fn cleanup_failure_names_repository_relative_paths() {
         let root = crate::test_tempdir::TempDir::new().expect("a temporary root");
-        let not_a_directory = root.path().join("not-a-directory");
-        fs::create_dir(&not_a_directory).expect("the directory is created");
-        let created = capture_created_directory(&not_a_directory)
-            .expect("the created directory identity is read");
-        fs::remove_dir(&not_a_directory).expect("the directory is removed");
-        fs::write(&not_a_directory, "content").expect("the replacement file is created");
-        let snapshot = Snapshot {
-            target: not_a_directory.clone(),
+        let filesystem = filesystem(&root);
+        filesystem
+            .create_dir(Path::new("not-a-directory"))
+            .expect("the directory is created");
+        let created = filesystem
+            .track_dir(Path::new("not-a-directory"))
+            .expect("the identity is captured");
+        fs::remove_dir(root.path().join("not-a-directory")).expect("the directory is removed");
+        fs::write(root.path().join("not-a-directory"), "content")
+            .expect("the replacement file is created");
+        let mut snapshot = Snapshot {
+            target: PathBuf::from("not-a-directory"),
             content: None,
             modified: None,
             inode: None,
@@ -1530,219 +1442,183 @@ mod tests {
         };
 
         let error = snapshot
-            .remove_created_directories(root.path())
-            .expect_err("reading the file as a directory fails");
+            .remove_created_directories(root.path(), &filesystem)
+            .expect_err("the replaced path is not a directory");
 
         assert!(error.contains("not-a-directory"), "{error}");
         assert!(error.contains("no longer a directory"), "{error}");
-        assert!(
-            !error.contains(root.path().to_str().expect("the root is UTF-8")),
-            "the error contains an absolute path: {error}"
-        );
+        assert!(!error.contains(root.path().to_str().expect("the root is UTF-8")));
     }
 
     #[cfg(unix)]
     #[test]
-    fn directory_creation_refuses_an_outside_traversal_candidate_before_creating_it() {
+    fn directory_creation_refuses_an_outside_traversal_before_creating_it() {
+        use std::os::unix::fs::symlink;
+
         let root = crate::test_tempdir::TempDir::new().expect("a temporary root");
         let outside = crate::test_tempdir::TempDir::new().expect("an outside directory");
-        let root_path = fs::canonicalize(root.path()).expect("the root is resolved");
-        let outside_path = fs::canonicalize(outside.path()).expect("outside is resolved");
-        let link = root.path().join("link");
-        std::os::unix::fs::symlink(&outside_path, &link).expect("the link is made");
-        let root_name = root_path
+        let filesystem = filesystem(&root);
+        let outside_path = fs::canonicalize(outside.path()).expect("outside resolves");
+        symlink(&outside_path, root.path().join("link")).expect("the outside link is made");
+        let root_name = root
+            .path()
             .file_name()
             .expect("the temp root has a name")
             .to_string_lossy();
         let relative = format!("link/sub/../../{root_name}/generated.md");
-        let resolved = root_path.join("generated.md");
+        let resolved = fs::canonicalize(root.path())
+            .expect("root resolves")
+            .join("generated.md");
         assert_eq!(
-            path::inside_repository(root.path(), &relative).expect("the file resolves in root"),
+            path::inside_repository(root.path(), &relative).unwrap(),
             resolved
         );
         let mut creates = 0;
 
-        let error = create_directories_with(root.path(), &relative, &resolved, |directory| {
-            creates += 1;
-            fs::create_dir(directory)
-        })
-        .expect_err("the outside traversal directory is refused");
-
-        assert_eq!(creates, 0, "the rejected candidate was created");
-        assert!(
-            error
-                .cause
-                .to_string()
-                .contains("must lie inside the repository root"),
-            "{}",
-            error.cause
-        );
-        assert!(
-            !outside.path().join("sub").exists(),
-            "the outside candidate was left behind"
-        );
-        assert!(error.rollback.is_empty(), "rollback left paths behind");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_candidate_that_escapes_after_validation_is_reported_left_behind() {
-        let root = crate::test_tempdir::TempDir::new().expect("a temporary root");
-        let outside = crate::test_tempdir::TempDir::new().expect("an outside directory");
-        let root_path = fs::canonicalize(root.path()).expect("the root is resolved");
-        let outside_path = fs::canonicalize(outside.path()).expect("outside is resolved");
-        let unrelated = outside.path().join("keep.txt");
-        fs::write(&unrelated, "keep").expect("the unrelated outside file is written");
-        let internal = root_path.join("internal");
-        fs::create_dir(&internal).expect("the internal target is made");
-        let link = root_path.join("link");
-        std::os::unix::fs::symlink(&internal, &link).expect("the link is made");
-        let relative = "link/sub/../generated.md";
-        let resolved = path::inside_repository(root.path(), relative)
-            .expect("the generated target initially resolves inside root");
-        let candidate = root.path().join("link/sub");
-
-        let error = create_directories_with(root.path(), relative, &resolved, |directory| {
-            assert_eq!(directory, candidate);
-            fs::remove_file(&link)?;
-            std::os::unix::fs::symlink(&outside_path, &link)?;
-            fs::create_dir(directory)
-        })
-        .expect_err("post-create containment validation detects the swapped link");
-
-        assert!(outside.path().join("sub").is_dir());
-        assert_eq!(
-            fs::read_to_string(&unrelated).expect("the unrelated outside file remains"),
-            "keep"
-        );
-        let rollback = error.rollback_message(root.path());
-        assert!(rollback.contains("link/sub"), "{rollback}");
-        assert!(rollback.contains("candidate left in place"), "{rollback}");
-        assert!(rollback.contains("working tree was modified"), "{rollback}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cleanup_rechecks_containment_before_removing_a_traversal_directory() {
-        let root = crate::test_tempdir::TempDir::new().expect("a temporary root");
-        let outside = crate::test_tempdir::TempDir::new().expect("an outside directory");
-        let internal_target = root.path().join("internal");
-        let candidate = internal_target.join("sub");
-        fs::create_dir_all(&candidate).expect("the candidate directory is created");
-        let link = root.path().join("link");
-        std::os::unix::fs::symlink(&internal_target, &link).expect("the link is made");
-        let created = capture_created_directory(&link.join("sub"))
-            .expect("the created directory identity is captured");
-        let moved_target = outside.path().join("moved");
-
-        let error = remove_created_directory_with(root.path(), &created, || {
-            fs::remove_file(&link).expect("the original link is removed");
-            fs::rename(&internal_target, &moved_target).expect("the target is moved outside");
-            std::os::unix::fs::symlink(&moved_target, &link).expect("the outside link is made");
-        })
-        .expect_err("the final containment validation refuses the outside path");
-
-        assert!(
-            error.to_string().contains("outside the repository root"),
-            "{error}"
-        );
-        assert!(
-            verify_created_directory_identity(&created)
-                .expect("the same directory identity is still present"),
-            "the test did not preserve the tracked directory identity"
-        );
-        assert!(
-            moved_target.join("sub").is_dir(),
-            "cleanup removed the directory after its ancestor redirected outside"
-        );
-    }
-
-    #[test]
-    fn an_unavailable_directory_identity_leaves_and_reports_the_candidate() {
-        let root = crate::test_tempdir::TempDir::new().expect("a temporary root");
-        let resolved = root.path().join("new/generated.md");
-        let candidate = root.path().join("new");
-        let mut creates = 0;
-
-        let error = create_directories_with_capture(
+        let error = create_directories_with(
             root.path(),
-            "new/generated.md",
+            &filesystem,
+            &relative,
             &resolved,
-            |_| {
+            |filesystem, directory| {
                 creates += 1;
-                fs::create_dir(&candidate)
-            },
-            |_| {
-                Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "the filesystem did not provide a high-resolution file identity",
-                ))
+                filesystem.create_dir(directory)
             },
         )
-        .expect_err("the candidate cannot be tracked without an identity");
+        .expect_err("the outside traversal is refused");
 
-        assert_eq!(creates, 1, "directory creation was refused pre-emptively");
-        assert!(
-            candidate.is_dir(),
-            "the untracked candidate was removed by name"
-        );
+        assert_eq!(creates, 0);
         assert!(
             error
                 .cause
                 .to_string()
-                .contains("high-resolution file identity"),
-            "{}",
-            error.cause
+                .contains("must lie inside the repository root")
         );
-        let rollback = error.rollback_message(root.path());
-        assert!(rollback.contains("new"), "{rollback}");
-        assert!(rollback.contains("candidate left in place"), "{rollback}");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_directory_creation_uses_high_resolution_identity() {
-        let root = crate::test_tempdir::TempDir::new().expect("a temporary root");
-        let resolved = root.path().join("new/generated.md");
-        let candidate = root.path().join("new");
-
-        let created = create_directories(root.path(), "new/generated.md", &resolved)
-            .expect("Windows directory creation has a high-resolution identity");
-
-        assert_eq!(created.len(), 1);
-        assert!(candidate.is_dir(), "the directory was not created");
-        assert!(remove_created_empty_directories(root.path(), &created).is_empty());
-        assert!(!candidate.exists(), "the tracked directory was not removed");
+        assert!(!outside.path().join("sub").exists());
+        assert!(error.rollback.is_empty());
     }
 
     #[cfg(unix)]
     #[test]
-    fn failed_directory_rollback_reports_every_directory_left_behind() {
+    fn root_capability_blocks_creation_after_a_traversal_link_is_redirected() {
+        use std::os::unix::fs::symlink;
+
         let root = crate::test_tempdir::TempDir::new().expect("a temporary root");
+        let outside = crate::test_tempdir::TempDir::new().expect("an outside directory");
+        let filesystem = filesystem(&root);
+        let internal = root.path().join("internal");
+        fs::create_dir(&internal).expect("the internal directory is made");
+        let link = root.path().join("link");
+        symlink(&internal, &link).expect("the internal link is made");
+        let outside_keep = outside.path().join("keep.txt");
+        fs::write(&outside_keep, "keep").expect("the unrelated file is written");
+        let relative = "link/sub/../generated.md";
+        let resolved = path::inside_repository(root.path(), relative).unwrap();
+
+        let error = create_directories_with(
+            root.path(),
+            &filesystem,
+            relative,
+            &resolved,
+            |filesystem, candidate| {
+                if candidate == Path::new("internal/sub") {
+                    fs::remove_file(&link)?;
+                    symlink(outside.path(), &link)?;
+                }
+                filesystem.create_dir(candidate)
+            },
+        )
+        .expect_err("post-creation alias validation detects the redirection");
+
+        assert!(!outside.path().join("sub").exists());
+        assert_eq!(fs::read_to_string(outside_keep).unwrap(), "keep");
+        let rollback = error.rollback_message(root.path());
+        assert!(rollback.contains("internal/sub"), "{rollback}");
+        assert!(rollback.contains("candidate left in place"), "{rollback}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_cannot_follow_a_redirected_ancestor_outside_the_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = crate::test_tempdir::TempDir::new().expect("a temporary root");
+        let outside = crate::test_tempdir::TempDir::new().expect("an outside directory");
+        let filesystem = filesystem(&root);
+        filesystem.create_dir(Path::new("sub")).unwrap();
+        filesystem.create_dir(Path::new("sub/x")).unwrap();
+        let mut created = filesystem.track_dir(Path::new("sub/x")).unwrap();
+        let outside_keep = outside.path().join("keep");
+        fs::create_dir(&outside_keep).expect("the outside empty directory is made");
+        fs::rename(root.path().join("sub"), outside.path().join("moved"))
+            .expect("the tracked ancestor is moved outside");
+        symlink(outside.path().join("moved"), root.path().join("sub"))
+            .expect("the ancestor is redirected");
+
+        let error = remove_created_directory_with(&filesystem, &mut created, || {})
+            .expect_err("root-relative cleanup refuses the outside path");
+
+        assert!(
+            outside.path().join("moved/x").is_dir(),
+            "cleanup removed the moved directory"
+        );
+        assert!(
+            outside_keep.is_dir(),
+            "the outside empty directory was removed"
+        );
+        assert!(
+            error.to_string().contains("outside")
+                || error.kind() == io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn rollback_reports_nonempty_directories_and_preserves_their_contents() {
+        let root = crate::test_tempdir::TempDir::new().expect("a temporary root");
+        let filesystem = filesystem(&root);
         let resolved = root.path().join("a/b/c/generated.md");
         let mut calls = 0;
 
-        let error =
-            create_directories_with(root.path(), "a/b/c/generated.md", &resolved, |directory| {
+        let error = create_directories_with(
+            root.path(),
+            &filesystem,
+            "a/b/c/generated.md",
+            &resolved,
+            |filesystem, directory| {
                 calls += 1;
                 if calls == 3 {
                     return Err(io::Error::other("injected creation failure"));
                 }
-                fs::create_dir(directory)?;
+                filesystem.create_dir(directory)?;
                 if calls == 2 {
-                    fs::write(directory.join("external.txt"), "keep")?;
+                    filesystem.write(&directory.join("external.txt"), b"keep")?;
                 }
                 Ok(())
-            })
-            .expect_err("the third directory creation fails");
+            },
+        )
+        .expect_err("the third directory creation fails");
 
         assert_eq!(error.rollback.len(), 2);
-        assert_eq!(error.rollback[0].0, root.path().join("a/b"));
-        assert_eq!(error.rollback[1].0, root.path().join("a"));
+        assert_eq!(error.rollback[0].0, PathBuf::from("a/b"));
+        assert_eq!(error.rollback[1].0, PathBuf::from("a"));
         let message = error.rollback_message(root.path());
         assert!(message.contains("a/b"), "{message}");
-        assert!(message.contains("a:"), "{message}");
         assert!(message.contains("working tree was modified"), "{message}");
         assert!(root.path().join("a/b/external.txt").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_cleanup_uses_retained_capabilities() {
+        let root = crate::test_tempdir::TempDir::new().expect("a temporary root");
+        let filesystem = filesystem(&root);
+        let mut created = vec![
+            filesystem
+                .create_tracked_dir(Path::new("new"))
+                .expect("the directory is created and pinned"),
+        ];
+
+        assert!(remove_created_empty_directories(&filesystem, &mut created).is_empty());
+        assert!(filesystem.symlink_metadata(Path::new("new")).is_err());
     }
 }
