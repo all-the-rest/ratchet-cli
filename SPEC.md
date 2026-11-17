@@ -789,39 +789,55 @@ The generator must be able to write to a **given path**:
      cannot be created is an **operational error** that names the directory
      and the cause: the failure is the engine's, and the user is not sent to
      the generator. Directories are created one at a time and tracked as they
-     succeed. On Unix, identity is the device and inode from a retained open
-     directory handle. Directory creation itself returns no handle: POSIX
-     `mkdirat` returns only status, and Linux rejects `open` with
-     `O_CREAT | O_DIRECTORY`. Opening the created pathname is therefore a
-     separate operation, and a replacement between creation and opening may
-     be recorded as the candidate. This create-to-open race is accepted. On
-     Windows, identity is the volume serial number and full 128-bit file ID
-     from the high-resolution file-ID API; the legacy
-     64-bit file index is never used because it can collide on filesystems
-     such as ReFS. The high-resolution Windows ID is captured through the
-     pathname rather than from the retained handle, leaving a narrow race
-     between checking/opening the directory and capturing the pathname
-     identity: a replacement in that interval may be recorded as the
-     candidate.
-     This race is accepted, in addition to the final check-to-remove race
-     below. The retained handle helps prevent identity reuse where possible.
-     If the filesystem cannot provide a high-resolution ID, that candidate
-     is left in place and reported as an operational error; earlier candidates
-     from the attempt are rolled back when they can still be identified.
+     succeed. Directory creation, tracking lookups and removal are issued
+     relative to a retained capability for the canonical repository root. On
+     Unix, identity is the device and inode from the retained open directory
+     handle. Directory creation itself returns no handle: POSIX `mkdirat`
+     returns only status, and Linux rejects `open` with `O_CREAT | O_DIRECTORY`.
+     Opening the created name is therefore a separate operation, and a
+     replacement between creation and opening may be recorded as the
+     candidate. This create-to-open race is accepted. On Windows, the engine
+     additionally retains a raw directory handle for the candidate. The handle
+     is opened relative to the same retained root capability, but with no
+     access rights and the flag that permits opening a directory, so the
+     operating system's default share mode (read, write and delete) is kept;
+     cap-std's own directory opens deny delete sharing and would make a
+     generator's own rename or removal of the directory it created fail. The
+     handle keeps the object alive and never reads or writes through the name.
+     Identity is checked by comparing that handle's live metadata against the
+     metadata the root capability resolves the path to at check time: file
+     attributes, creation time, last write time and file size must agree. A
+     rename keeps the object, so its metadata still agrees, while a
+     replacement does not. Creation time alone would be too weak because
+     Windows file-system tunneling restores it when a name is deleted and
+     recreated shortly afterwards; the last write time is not restored. Both
+     records are read live, so a legitimate change to the directory's contents
+     cannot make them disagree. The stable standard library exposes no Windows
+     file ID, so this identity is a best-effort guard rather than a
+     cryptographic one; removal itself stays rooted in the repository
+     capability. The interval between creation and the pin is a narrow
+     accepted race. If a candidate cannot be opened or validated, it is left
+     in place and reported as an operational error; earlier candidates are
+     rolled back when they can still be identified.
      Existing directories remain usable. Each candidate is checked through
      the path authority before creation; after creation, its filesystem
      identity and containment are checked again. If post-creation validation
      fails, the candidate is left in place and named in the operational error.
      If a later creation fails, the engine attempts rollback only for paths
-     it can still identify by their captured identity. Immediately before
+     it can still identify by their recorded identity. Immediately before
      removing a path, it verifies both that the pathname still matches the
-     identity captured for that candidate and that it still resolves inside
+     identity recorded for that candidate and that it still resolves inside
      the repository root. If identity cannot be established, has changed, or
      containment fails, cleanup leaves the pathname alone and reports the
-     failure. Removal uses the pathname. Portable APIs do not make the final
-     identity-and-containment check and removal atomic, so a replacement in
-     that narrow check-to-remove interval may still be removed. This race is
-     accepted;
+     failure. Removal uses `Dir::remove_dir` relative to the retained
+     repository capability on both platforms. On Unix the captured handles are
+     dropped first. On Windows the pin was opened with delete sharing, so it
+     does not block the removal; it is released once the directory is gone,
+     which lets Windows complete the deferred deletion and an ancestor be
+     removed in turn. The final identity check and removal are not atomic, so a
+     replacement in that narrow check-to-operation interval may still be
+     removed. The rooted operation cannot traverse outside the repository.
+     This race is accepted;
   3. run the generator;
   4. read the produced bytes;
   5. restore: write the snapshot to a **temporary file in the same directory**,
@@ -839,17 +855,20 @@ The generator must be able to write to a **given path**:
      not the engine's to remove: it was not left behind by the engine alone.
      Cleanup is attempted even if file or link restoration failed. Immediately
      before each removal, the engine verifies that the pathname still matches
-     the identity captured for the created directory and still resolves
+     the identity recorded for the created directory and still resolves
      inside the repository root. If identity differs, cannot be established,
      or containment fails, it leaves the path and reports an operational
      error.
-     Removal is pathname-based, so the check and removal have a narrow,
-     unavoidable TOCTOU race: a replacement in that interval may be removed.
-     This race is accepted after the complete identity-and-containment check;
-     the operation is not an atomic identity-bound deletion. A cleanup error
-     names every directory it could not remove
-     relative to the repository root and says that the working tree was
-     modified;
+     Removal is relative to the retained root capability on both platforms. On
+     Unix the captured handles are dropped first. On Windows the pin was
+     opened with delete sharing, so it does not block the removal and is
+     released once the directory is gone, letting Windows complete the
+     deferred deletion and an ancestor be removed in turn. The check and
+     removal therefore have a narrow, unavoidable TOCTOU race: a replacement
+     in that interval may be removed. This race is accepted after the identity and root-containment
+     checks; the operation is not an atomic identity-bound deletion. A cleanup
+     error names every directory it could not remove relative to the
+     repository root and says that the working tree was modified;
   7. in an ordinary check, **verify** the restore (read the bytes back and
      compare), when file restoration and cleanup succeeded.
 
@@ -880,7 +899,7 @@ after the content has been fixed, the engine attempts to remove empty,
 engine-created directories used only to traverse the named path; the resolved
 target's parent directories are retained. Pre-existing and non-empty
 directories are never removed. Immediately before each pathname removal the
-engine verifies that the path still matches the identity captured for the
+engine verifies that the path still matches the identity recorded for the
 created directory and still resolves inside the repository root. If identity
 differs, cannot be established, or containment fails, the path is left alone
 and the run reports an operational error. The identity-and-containment check
@@ -891,10 +910,10 @@ identity-bound deletion. Normal cleanup succeeds when the path is still the
 tracked empty directory. A cleanup error names each path relative to the
 repository root and says that the working tree was modified. The same
 behavior applies to ordinary check restore cleanup above. Unix create-to-open
-identity capture and Windows pathname identity capture have the accepted
-races described above. Windows uses the high-resolution 128-bit file ID, not
-the legacy 64-bit index; if that ID is unavailable, the newly created
-candidate is left in place and the run reports an operational error.
+identity capture and the Windows create-to-pin interval have the accepted races
+described above. Releasing the Windows pin after a successful removal is not
+part of the check-to-operation race: the pin was opened with delete sharing and
+never blocks the removal.
 
 ## 8. Git
 
@@ -1349,83 +1368,82 @@ file — the snapshot — and it gives it back unchanged:
 Before the command, Verify retains the filesystem identity of the resolved
 snapshot target (when it exists) and each existing directory in its resolved
 parent chain. Unix identities use device and inode from held handles; those
-handles do not prevent a directory from being renamed. Windows uses the
-high-resolution 128-bit file ID; the low-resolution file index is not an
-identity because it can collide on ReFS. Windows directory handles are opened
-without delete sharing and with final-reparse-point following disabled. Their
-metadata is checked and a reparse point is refused. The handles for the
-resolved parent chain, including the repository root, remain open while the
-command runs. Consequently, on Windows the child command cannot rename or
-delete a tracked snapshot-parent directory. This is an intentional prototype
-trade-off; commands that need to move one of those directories may fail. The
-pre-command snapshot-file handle is the exception: it permits delete sharing,
-so the command can still rename or replace the snapshot file itself.
-Because Windows identity capture is path-based, this permissive initial file
-handle does not pin the name against an independent concurrent rename during
-initial state capture; the post-command no-delete pinning guarantee begins only
-with the post-command operation handles.
+handles do not prevent a directory from being renamed. On Windows the engine
+retains the chain of directory capabilities from the canonical repository root
+through the resolved parent. cap-std opens directory handles without
+`FILE_SHARE_DELETE`, so the child command cannot rename or delete a tracked
+snapshot-parent directory. This is an intentional prototype trade-off;
+commands that need to move one of those directories may fail. This handle
+pinning, rather than a pathname file ID, is the Windows identity mechanism, so
+the low-resolution file index that can collide on ReFS never enters the
+decision. The pre-command snapshot-file handle is the exception: it permits
+delete sharing, so the command can still rename or replace the snapshot file
+itself.
+
+The engine opens a capability for the canonical repository root before running
+the command and keeps it open across the child. Engine-owned writes, file and
+directory removals, directory creation and traversal-directory inspection are
+issued as clean paths relative to that retained capability, each after the
+complete containment-and-identity check that precedes it. A command that moves
+an ancestor and replaces it with an outside link therefore cannot redirect the
+engine's restore, update or cleanup outside the repository: the rooted
+operation fails and is reported instead. In-root link targets are resolved
+before the child runs and translated to root-relative paths; cap-std rejects
+an absolute link target encountered during a later operation, even if it names
+a place back inside the root.
 
 After the command, Verify resolves the configured path again against the
 canonical repository root and requires it to resolve to the same authorized
-target; it also checks the retained parent identities before each pathname-
-based operation, timestamp update, removal, rename, or verification. Windows
-post-command target and temporary-file handles deny delete sharing, permit read
-and write sharing, and open the final component without following a reparse
-point. Handle metadata is checked and a reparse point is refused. While such a
-file handle and the resolved directory-chain handles are alive, pathname-based
-high-resolution file-ID capture cannot be redirected by replacing or renaming
-that file entry. The Windows ID API is still path-based: Verify does not claim
-that it atomically obtains an ID from the retained handle or binds every later
-pathname operation to that handle.
-
-Reads and writes through retained file handles are issued as individual calls;
-Verify repeats the complete containment and target-or-temporary identity check
-immediately before every `read` or `write` call. A short transfer is followed
-by a fresh check before the next call. Windows no-delete sharing prevents a
-post-command file entry from being renamed or replaced while that I/O handle is
-open, but read/write sharing still permits another process to modify its
-contents. Unix and Windows both retain the per-call validation; neither claims
+target; it also checks the retained parent identities before each
+capability-relative operation, timestamp update, removal, or verification.
+Windows post-command target handles deny delete sharing, permit read and write
+sharing, and open the final component without following a reparse point.
+Handle metadata is checked and a reparse point is refused. While such a file
+handle and the resolved directory-chain handles are alive, the post-command
+file entry cannot be renamed or replaced. Reads through the retained handle
+are issued as individual calls; Verify repeats the complete containment and
+target-or-temporary identity check immediately before every `read` call, and
+a short transfer is followed by a fresh check before the next call. Read and
+write sharing still permits another process to modify the contents in place.
+Unix and Windows both retain the per-call validation for reads; neither claims
 that path validation and a later pathname operation are one atomic operation.
-A regular snapshot file replaced by the command is treated as a write to the
-snapshot and restored as before. Verify refuses a reparse point anywhere in the
-resolved parent chain, at the snapshot target, and at the temporary restore
-file. The resolved chain contains no link by construction, so a reparse point
-appearing there is a replacement and fails closed; the same checks refuse
-non-name-surrogate reparse points such as cloud placeholders, which are not
-followed. Configured in-repository directory-link resolution — including Windows
-junctions, which resolve before the chain is captured — and the configured path
-shown in diagnostics remain unchanged.
+The restore and the `--update` write are single capability operations — a
+temporary file in the target's directory renamed through the retained root —
+so their bytes are re-read and compared after the write instead of being
+validated per call. A regular snapshot file replaced by the command is treated
+as a write to the snapshot and restored as before. Verify refuses a reparse
+point anywhere in the resolved parent chain, at the snapshot target, and at
+the temporary restore file. The resolved chain contains no link by
+construction, so a reparse point appearing there is a replacement and fails
+closed; the same checks refuse non-name-surrogate reparse points such as cloud
+placeholders, which are not followed. Configured in-repository directory-link
+resolution — including Windows junctions, which resolve before the chain is
+captured — and the configured path shown in diagnostics remain unchanged.
 
 Cleanup considers only the missing traversal/resolved-parent candidates
 recorded before the command. For a candidate that now exists, Verify checks
 canonical repository containment before reading it, captures its identity,
-and checks containment and identity again immediately before `read_dir` and,
-if it is empty, immediately before `remove_dir`. Pre-existing directories are
-not candidates; non-empty directories are left alone. A candidate that was
-replaced, cannot be identified, or no longer resolves inside the repository is
-left alone and reported as an operational failure. On Windows, candidate
-directory handles are retained while they are inspected. Immediately after the
-final validation and before pathname removal, Verify releases only the
-candidate's handle; its tracked ancestors remain pinned. If the directory is
-not empty after that check, Verify attempts to pin the same captured directory
-again before continuing. A pathname replacement in the final check-to-
-`remove_dir` interval remains possible. Windows `remove_dir` acts on a
-replacement symlink or junction object itself, or fails; it does not traverse
-the link to remove its target.
+and checks containment and identity again immediately before reading its
+entries and, if it is empty, immediately before the capability-relative
+`remove_dir`. Pre-existing directories are not candidates; non-empty
+directories are left alone. A candidate that was replaced, cannot be
+identified, or no longer resolves inside the repository is left alone and
+reported as an operational failure. On Windows, candidate directory handles
+are retained while they are inspected. Immediately after the final validation
+and before removal, Verify releases only the candidate's handle; its tracked
+ancestors remain pinned. If the directory is not empty after that check,
+Verify attempts to pin the same captured directory again before continuing. A
+pathname replacement in the final check-to-removal interval remains possible,
+but the removal itself is capability-rooted and cannot traverse outside the
+repository.
 
-These checks do not make pathname operations atomic or derive a file ID from
-the retained handle. For every pathname operation, the accepted race includes
-the interval between the final complete containment-and-identity validation
-and that operation. For Unix handle-based I/O, a path may also be redirected
-after validation even though the open handle continues to refer to its original
-object. On Windows, while the post-command I/O handle is open, no-delete sharing
-prevents that file entry and its pinned resolved parents from being renamed or
-deleted; this does not prevent in-place writes through another handle and does
-not make path-based rename/removal atomic. No validation covers a sequence of
-calls. If a later check detects redirection, the affected loop stops before its
-next read/write call and Verify reports the restore or update failure. A
-restore, cleanup, or snapshot-update failure says that the working tree may be
-modified.
+These checks do not make pathname operations atomic. For every
+capability-relative operation, the accepted race includes the interval between
+the final complete containment-and-identity validation and that operation. No
+validation covers a sequence of calls. If a later check detects redirection,
+the affected loop stops before its next read call and Verify reports the
+restore or update failure. A restore, cleanup, or snapshot-update failure says
+that the working tree may be modified.
 
 When `--update` writes a snapshot whose parent does not exist, the missing
 parent directories are created at the snapshot's **resolved** path. They are

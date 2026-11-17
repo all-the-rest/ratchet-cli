@@ -6336,6 +6336,43 @@ fn verify_restore_refuses_a_snapshot_parent_replaced_with_an_outside_link() {
 
 #[cfg(unix)]
 #[test]
+fn verify_restore_does_not_write_through_a_snapshot_ancestor_redirected_outside() {
+    let outside = Outside::new("verify-restore-redirect");
+    std::fs::write(outside.file("snapshot.txt"), "outside must stay\n")
+        .expect("the outside snapshot is written");
+    let outside_path = outside.path().to_string_lossy().replace('\'', "'\\''");
+    let repo = Repo::new(
+        &verify_config("benchmark", &["sh", "bench.sh"], "sub/snapshot.txt"),
+        None,
+    );
+    repo.write("sub/snapshot.txt", "100 ops/s\n");
+    repo.write(
+        "bench.sh",
+        &format!(
+            "#!/bin/sh\nprintf 'changed by command\\n' > sub/snapshot.txt\n\
+             mv sub '{outside_path}/moved'\n\
+             ln -s '{outside_path}' sub\nprintf '100 ops/s\\n'\n"
+        ),
+    );
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "verify command"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert_eq!(
+        std::fs::read_to_string(outside.file("snapshot.txt")).unwrap(),
+        "outside must stay\n",
+        "restore created or overwrote the outside snapshot"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.file("moved/snapshot.txt")).unwrap(),
+        "changed by command\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn verify_traversal_cleanup_refuses_a_parent_replaced_with_an_outside_link() {
     let outside = Outside::new("verify-traversal-parent-swap");
     std::fs::create_dir(outside.file("x")).expect("the outside x directory is created");
@@ -6450,6 +6487,47 @@ fn verify_refuses_a_junction_to_an_outside_directory_in_a_traversal_path() {
     assert!(
         !outside.file("snapshot.txt").exists(),
         "the restore wrote the snapshot outside the repository"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_cleanup_does_not_remove_an_outside_empty_directory_after_parent_traversal() {
+    let outside = Outside::new("verify-cleanup-redirect");
+    std::fs::create_dir(outside.file("x")).expect("the outside empty directory is made");
+    std::fs::write(outside.file("keep.txt"), "keep\n").expect("the outside file is written");
+    let outside_path = outside.path().to_string_lossy().replace('\'', "'\\''");
+    let repo = Repo::new(
+        &verify_config("benchmark", &["sh", "bench.sh"], "sub/x/../snapshot.txt"),
+        None,
+    );
+    repo.write(
+        "bench.sh",
+        &format!(
+            "#!/bin/sh\nmkdir -p sub/x\n\
+             printf 'created by command\\n' > sub/x/../snapshot.txt\n\
+             mv sub '{outside_path}/moved'\n\
+             ln -s '{outside_path}' sub\nprintf '100 ops/s\\n'\n"
+        ),
+    );
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "verify command"]);
+
+    let output = repo.run(&["verify"]);
+
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert!(
+        outside.file("x").is_dir(),
+        "cleanup removed the outside directory"
+    );
+    assert_eq!(
+        std::fs::read_dir(outside.file("x")).unwrap().count(),
+        0,
+        "cleanup changed the outside empty directory"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.file("keep.txt")).unwrap(),
+        "keep\n"
     );
 }
 

@@ -290,50 +290,9 @@ pub fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
     Ok(())
 }
 
-/// The high-resolution identity of the object a path names.
-///
-/// The low-resolution file index is not an identity: it can collide on ReFS, so
-/// a filesystem that only offers it is refused. The gates map the pair onto
-/// their own identity type; the rule itself lives here once, so the drift gate
-/// and the pre-release check cannot drift apart.
-#[cfg(windows)]
-pub(crate) fn high_resolution_identity(path: &Path) -> io::Result<(u64, u128)> {
-    high_resolution_from(file_id::get_high_res_file_id(path)?)
-}
-
-/// The pair of a file ID, or the refusal of a low-resolution index.
-#[cfg(windows)]
-fn high_resolution_from(identity: file_id::FileId) -> io::Result<(u64, u128)> {
-    match identity {
-        file_id::FileId::HighRes {
-            volume_serial_number,
-            file_id,
-        } => Ok((volume_serial_number, file_id)),
-        _ => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "the filesystem did not provide a high-resolution file identity",
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(windows)]
-    #[test]
-    fn a_low_resolution_file_id_is_not_an_identity() {
-        let error = high_resolution_from(file_id::FileId::LowRes {
-            volume_serial_number: 7,
-            file_index: 11,
-        })
-        .expect_err("the low-resolution ID can collide on ReFS");
-
-        assert!(
-            error.to_string().contains("high-resolution file identity"),
-            "{error}"
-        );
-    }
 
     #[cfg(unix)]
     #[test]

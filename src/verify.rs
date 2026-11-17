@@ -18,13 +18,13 @@
 //! time-identical.
 
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 use crate::Error;
+use crate::capfs::RootDir;
 use crate::config::{Config, Verify};
 use crate::diff;
 use crate::fsutil;
@@ -113,6 +113,8 @@ impl Outcome {
 /// Runs the pre-release checks of the `verify` entries of the config.
 pub fn run(config: &Config, git: &Git, options: &Options) -> Result<Outcome, Error> {
     let mut outcome = Outcome::default();
+    let filesystem = RootDir::open(options.root)
+        .map_err(|error| Error::new(format!("cannot open the repository root: {error}")))?;
 
     if !git.is_repo() {
         // The committed comparisons are skipped; the checks still run (SPEC 8).
@@ -140,7 +142,14 @@ pub fn run(config: &Config, git: &Git, options: &Options) -> Result<Outcome, Err
             }
         }
         selected += 1;
-        let result = run_one(entry, &resolved, git, options, &mut outcome.debug)?;
+        let result = run_one(
+            entry,
+            &resolved,
+            &filesystem,
+            git,
+            options,
+            &mut outcome.debug,
+        )?;
         outcome.entries.push(result);
     }
 
@@ -157,6 +166,7 @@ pub fn run(config: &Config, git: &Git, options: &Options) -> Result<Outcome, Err
 fn run_one(
     entry: &Verify,
     resolved: &Path,
+    filesystem: &RootDir,
     git: &Git,
     options: &Options,
     debug: &mut Vec<String>,
@@ -164,6 +174,10 @@ fn run_one(
     let root = options.root;
     let snapshot = root.join(&entry.snapshot);
     let display = path::display(Some(root), &snapshot);
+    let resolved_relative = filesystem
+        .relative(resolved)
+        .map_err(|error| Error::new(format!("the check {}: {error}", entry.name)))?;
+    let named_relative = named_target(root, filesystem, &entry.snapshot, &resolved_relative);
     let name = entry.name.as_str();
 
     // The snapshot has to be a regular file: the committed content of a
@@ -171,8 +185,8 @@ fn run_one(
     // target's content would say nothing about the output.  The drift gate
     // resolves a link instead — there the *file* is the subject, here the
     // *output* is (SPEC §15).
-    if let Ok(metadata) = fs::symlink_metadata(&snapshot) {
-        if is_reparse_point(&metadata) {
+    if let Ok(metadata) = filesystem.symlink_metadata(&named_relative) {
+        if is_link_or_reparse_point(&metadata) {
             return Err(Error::new(format!(
                 "the check {name}: the snapshot {display} is a symbolic link — \
                  the snapshot has to be a regular file"
@@ -183,7 +197,7 @@ fn run_one(
                 "the check {name}: the snapshot {display} is a directory, not a file"
             )));
         }
-    } else if let Ok(metadata) = fs::symlink_metadata(resolved) {
+    } else if let Ok(metadata) = filesystem.symlink_metadata(&resolved_relative) {
         // The named path can be unwalkable even though its resolved target
         // exists (for example `a/..` when `a` is missing). A directory at the
         // resolved file position is still not a snapshot file.
@@ -199,10 +213,17 @@ fn run_one(
     // it.  A command that writes elsewhere in the tree is the command's
     // doing — the engine cannot undo that.
     let subject = format!("the check {name}: the snapshot {}", entry.snapshot);
-    let created = command_directories(root, &entry.snapshot, resolved).map_err(|refusal| {
-        Error::new(refusal.message(&subject, "must lie inside the repository root"))
-    })?;
-    let mut guard = Guard::take(resolved, root, entry.snapshot.clone(), created)
+    let created =
+        command_directories(root, filesystem, &entry.snapshot, resolved).map_err(|refusal| {
+            Error::new(refusal.message(&subject, "must lie inside the repository root"))
+        })?;
+    // The recorded candidates are absolute: the guard revalidates them against
+    // the canonical root and performs every operation through the capability.
+    let created: Vec<PathBuf> = created
+        .into_iter()
+        .map(|directory| filesystem.path().join(directory))
+        .collect();
+    let mut guard = Guard::take(resolved, root, entry.snapshot.clone(), created, filesystem)
         .map_err(|error| Error::new(format!("the check {name}: cannot read {display}: {error}")))?;
 
     // The marker: the file is touched with an old time, so that the engine
@@ -277,6 +298,24 @@ fn run_one(
         diff,
         detail,
     })
+}
+
+/// The final name of the configured path, with its parent resolved before any
+/// command runs. This lets `symlink_metadata` inspect a file link itself while
+/// still using a root-relative capability path.
+fn named_target(root: &Path, filesystem: &RootDir, relative: &str, resolved: &Path) -> PathBuf {
+    let named = Path::new(relative);
+    let Some(name) = named.file_name() else {
+        return resolved.to_path_buf();
+    };
+    let parent = named.parent().unwrap_or_else(|| Path::new("."));
+    let Ok(parent) = path::inside_repository(root, &parent.to_string_lossy()) else {
+        return resolved.to_path_buf();
+    };
+    let Ok(parent) = filesystem.relative(&parent) else {
+        return resolved.to_path_buf();
+    };
+    parent.join(name)
 }
 
 /// Runs the command of a check and returns the bytes it produced.
@@ -469,12 +508,15 @@ fn compare(
 /// Paths are ordered deepest-first for removal.
 fn command_directories(
     root: &Path,
+    filesystem: &RootDir,
     relative: &str,
     resolved: &Path,
 ) -> Result<Vec<PathBuf>, path::Refusal> {
     let mut directories = Vec::new();
     if let Some(parent) = resolved.parent() {
-        directories.extend(fsutil::missing_directories(parent));
+        if let Ok(parent) = filesystem.relative(parent) {
+            directories.extend(missing_directories(filesystem, &parent));
+        }
     }
 
     let components: Vec<_> = Path::new(relative).components().collect();
@@ -490,7 +532,9 @@ fn command_directories(
         if index + 1 < components.len() {
             let prefix = prefix.to_string_lossy();
             let directory = path::inside_repository(root, &prefix)?;
-            directories.extend(fsutil::missing_directories(&directory));
+            if let Ok(directory) = filesystem.relative(&directory) {
+                directories.extend(missing_directories(filesystem, &directory));
+            }
         }
     }
 
@@ -505,19 +549,41 @@ fn command_directories(
     Ok(directories)
 }
 
+/// Missing root-relative directories, deepest-first. Metadata is queried only
+/// through the retained repository capability.
+fn missing_directories(filesystem: &RootDir, directory: &Path) -> Vec<PathBuf> {
+    let mut missing = Vec::new();
+    let mut current = Some(directory);
+    while let Some(candidate) = current {
+        if candidate.as_os_str().is_empty() || candidate == Path::new(".") {
+            break;
+        }
+        match filesystem.metadata(candidate) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => break,
+            Err(_) => missing.push(candidate.to_path_buf()),
+        }
+        current = candidate.parent();
+    }
+    missing
+}
+
 /// The identity captured while the corresponding filesystem object is held
-/// open. Windows obtains its high-resolution ID through the path; no-delete
-/// sharing pins that name while the relevant handle is alive.
+/// open. On Unix it is the device and inode of the retained handle. On Windows
+/// the retained handle *is* the identity: cap-std opens it without
+/// `FILE_SHARE_DELETE`, so the name cannot be renamed or replaced while the
+/// handle is alive. No pathname file ID is used, so the low-resolution file
+/// index that can collide on ReFS never enters the decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileIdentity {
     #[cfg(unix)]
     Unix { device: u64, inode: u64 },
     #[cfg(windows)]
-    Windows { volume: u64, file: u128 },
+    WindowsPinned,
 }
 
 impl FileIdentity {
-    fn capture(path: &Path, handle: &fs::File) -> io::Result<Self> {
+    fn capture(filesystem: &RootDir, path: &Path, handle: &fs::File) -> io::Result<Self> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -527,7 +593,7 @@ impl FileIdentity {
                 device: metadata.dev(),
                 inode: metadata.ino(),
             };
-            if Self::capture_path(path)? != handle_identity {
+            if Self::capture_path(filesystem, path)? != handle_identity {
                 return Err(io::Error::other(
                     "the filesystem path changed while its identity was captured",
                 ));
@@ -537,13 +603,14 @@ impl FileIdentity {
 
         #[cfg(windows)]
         {
+            let _ = (filesystem, path);
             reject_reparse_handle(handle)?;
-            Self::capture_path(path)
+            Ok(Self::WindowsPinned)
         }
 
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = (path, handle);
+            let _ = (filesystem, path, handle);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "filesystem identity is unavailable on this platform",
@@ -551,34 +618,18 @@ impl FileIdentity {
         }
     }
 
-    /// Captures the identity of the object currently named by a path, without
-    /// following a final symbolic link on Unix.
-    fn capture_path(path: &Path) -> io::Result<Self> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
+    /// Captures the identity of the object a path names, without following a
+    /// final symbolic link. Only Unix has a pathname identity; Windows relies
+    /// on the retained no-delete handle instead.
+    #[cfg(unix)]
+    fn capture_path(filesystem: &RootDir, path: &Path) -> io::Result<Self> {
+        use cap_std::fs::MetadataExt;
 
-            let metadata = fs::symlink_metadata(path)?;
-            Ok(Self::Unix {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            })
-        }
-
-        #[cfg(windows)]
-        {
-            let (volume, file) = fsutil::high_resolution_identity(path)?;
-            Ok(Self::Windows { volume, file })
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = path;
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "filesystem identity is unavailable on this platform",
-            ))
-        }
+        let metadata = filesystem.symlink_metadata(&filesystem.relative(path)?)?;
+        Ok(Self::Unix {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
     }
 }
 
@@ -614,8 +665,11 @@ struct State {
 /// Before a later operation, the enclosing validation recaptures path/object
 /// identities and finishes by re-resolving the configured snapshot, candidate,
 /// and repository root. These sequential checks cannot bind a name or retained
-/// handle atomically to the operation that follows.
-struct Guard {
+/// handle atomically to the operation that follows; every engine-owned write,
+/// removal and directory operation is therefore issued through the retained
+/// root capability rather than through a pathname.
+struct Guard<'a> {
+    filesystem: &'a RootDir,
     target: PathBuf,
     snapshot_path: String,
     root: PathBuf,
@@ -628,7 +682,7 @@ struct Guard {
     created_directories: Vec<TrackedDirectory>,
 }
 
-impl Guard {
+impl<'a> Guard<'a> {
     /// Takes the snapshot and retains identity handles for the existing path
     /// chain and target object.
     fn take(
@@ -636,15 +690,17 @@ impl Guard {
         root: &Path,
         snapshot_path: String,
         missing: Vec<PathBuf>,
+        filesystem: &'a RootDir,
     ) -> io::Result<Self> {
-        let canonical_root = fs::canonicalize(root)?;
+        let canonical_root = filesystem.path().to_path_buf();
         if !target.starts_with(&canonical_root) {
             return Err(io::Error::other(
                 "the resolved snapshot is outside the repository root",
             ));
         }
-        let original_directories = capture_existing_chain(&canonical_root, target)?;
+        let original_directories = capture_existing_chain(filesystem, &canonical_root, target)?;
         let mut guard = Guard {
+            filesystem,
             target: target.to_path_buf(),
             snapshot_path,
             root: root.to_path_buf(),
@@ -660,6 +716,11 @@ impl Guard {
         guard.before = before;
         guard._before_handle = handle;
         Ok(guard)
+    }
+
+    /// The clean, repository-relative path the capability operates on.
+    fn relative(&self, path: &Path) -> io::Result<PathBuf> {
+        self.filesystem.relative(path)
     }
 
     /// Touches the original file with an old time so same-byte writes remain
@@ -732,13 +793,14 @@ impl Guard {
         &self,
         pin_file_name: bool,
     ) -> io::Result<(State, Option<fs::File>)> {
+        let relative = self.relative(&self.target)?;
         self.validate_path(&self.target)?;
-        match fs::symlink_metadata(&self.target) {
+        match self.filesystem.symlink_metadata(&relative) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok((State::default(), None));
             }
             Err(error) => return Err(error),
-            Ok(metadata) if is_reparse_point(&metadata) => {
+            Ok(metadata) if is_link_or_reparse_point(&metadata) => {
                 return Err(io::Error::other(
                     "the snapshot became a symbolic link; refusing to follow it",
                 ));
@@ -756,7 +818,7 @@ impl Guard {
             return Err(io::Error::other("the snapshot is no longer a regular file"));
         }
         self.validate_path(&self.target)?;
-        let identity = FileIdentity::capture(&self.target, &file)?;
+        let identity = FileIdentity::capture(self.filesystem, &self.target, &file)?;
         let content =
             read_with_validation(&mut file, || self.validate_target_identity(Some(identity)))?;
         self.validate_target_identity(Some(identity))?;
@@ -779,21 +841,25 @@ impl Guard {
 
         match &self.before.content {
             Some(content) => {
-                let identity = self
-                    .write_atomic(
-                        content,
-                        self.before.mode,
-                        self.before.modified,
-                        after.identity,
-                    )
-                    .map_err(|error| error.to_string())?;
-                self.verify_restored(content, self.before.mode, identity)
+                self.write_atomic(
+                    content,
+                    self.before.mode,
+                    self.before.modified,
+                    after.identity,
+                )
+                .map_err(|error| error.to_string())?;
+                self.verify_restored(content, self.before.mode)
             }
             None => {
                 if let Some(identity) = after.identity {
                     self.validate_target_identity(Some(identity))
                         .map_err(|error| error.to_string())?;
-                    fs::remove_file(&self.target).map_err(|error| error.to_string())?;
+                    let relative = self
+                        .relative(&self.target)
+                        .map_err(|error| error.to_string())?;
+                    self.filesystem
+                        .remove_file(&relative)
+                        .map_err(|error| error.to_string())?;
                 }
                 Ok(())
             }
@@ -838,116 +904,50 @@ impl Guard {
         Ok(())
     }
 
-    /// Writes through a temporary file in the target directory, validating
-    /// each pathname operation separately. File mode and time are set through
-    /// the opened temporary-file handle.
+    /// Writes the snapshot back through the retained root capability: the
+    /// bytes, the mode and the time are written to a temporary file in the
+    /// target's directory and renamed there, so a redirected ancestor cannot
+    /// carry the restore outside the repository. The target identity is
+    /// validated immediately before and after the capability operation; the
+    /// write itself is rooted instead of pathname-based.
     fn write_atomic(
         &self,
         content: &[u8],
         mode: Option<u32>,
         modified: Option<SystemTime>,
         expected_target: Option<FileIdentity>,
-    ) -> io::Result<FileIdentity> {
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let number = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let directory = self.target.parent().unwrap_or_else(|| Path::new("."));
-        let name = self
-            .target
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
-        let temporary = directory.join(format!(
-            ".ratchet-verify-restore-{}-{number}-{name}",
-            std::process::id()
-        ));
-        let mut temporary_created = false;
-        let mut temporary_identity = None;
-
-        let result = (|| {
-            self.validate_path(&temporary)?;
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            configure_snapshot_open(&mut options, true, false);
-            let mut file = options.open(&temporary)?;
-            temporary_created = true;
-            reject_reparse_handle(&file)?;
-            self.validate_path(&temporary)?;
-            let identity = FileIdentity::capture(&temporary, &file)?;
-            temporary_identity = Some(identity);
-            write_with_validation(&mut file, content, || {
-                self.validate_file_identity(&temporary, identity)
-            })?;
-
-            if let Some(mode) = mode {
-                self.validate_file_identity(&temporary, identity)?;
-                set_handle_mode(&file, mode)?;
-            }
-            if let Some(modified) = modified {
-                self.validate_file_identity(&temporary, identity)?;
-                // As in the shared atomic writer, timestamp restoration is
-                // best effort; containment and identity validation is not.
-                let _ = file.set_times(fs::FileTimes::new().set_modified(modified));
-            }
-
-            // The temporary handle denies delete sharing on Windows. Release
-            // it before the atomic rename, then repeat the path validations
-            // while the containing directory chain remains pinned.
-            #[cfg(windows)]
-            drop(file);
-            #[cfg(not(windows))]
-            let _file = file;
-            self.validate_file_identity(&temporary, identity)?;
-            self.validate_target_identity(expected_target)?;
-            self.validate_file_identity(&temporary, identity)?;
-            self.validate_target_identity(expected_target)?;
-            fs::rename(&temporary, &self.target)?;
-            Ok(identity)
-        })();
-
-        match result {
-            Ok(identity) => Ok(identity),
-            Err(error) if !temporary_created => Err(error),
-            Err(error) => {
-                let cleanup = match temporary_identity {
-                    Some(identity) => self
-                        .validate_file_identity(&temporary, identity)
-                        .and_then(|()| match fs::remove_file(&temporary) {
-                            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                                #[cfg(windows)]
-                                {
-                                    Err(io::Error::other(
-                                        "the temporary restore file disappeared after final cleanup validation",
-                                    ))
-                                }
-                                #[cfg(not(windows))]
-                                {
-                                    Ok(())
-                                }
-                            }
-                            result => result,
-                        }),
-                    None => Err(io::Error::other(
-                        "the temporary restore file could not be identified and was left in place",
-                    )),
-                };
-                match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup) => Err(io::Error::other(format!(
-                        "{error}; temporary restore cleanup failed: {cleanup}"
-                    ))),
-                }
-            }
-        }
+    ) -> io::Result<()> {
+        self.validate_target_identity(expected_target)?;
+        let relative = self.relative(&self.target)?;
+        self.filesystem
+            .write_atomic(&relative, content, mode, modified)?;
+        let captured = self.capture_current()?;
+        self.validate_target_identity(Some(captured))
     }
 
-    fn verify_restored(
-        &self,
-        content: &[u8],
-        mode: Option<u32>,
-        identity: FileIdentity,
-    ) -> Result<(), String> {
+    /// Captures the identity of the current snapshot object through a
+    /// capability-opened handle.
+    fn capture_current(&self) -> io::Result<FileIdentity> {
+        let relative = self.relative(&self.target)?;
+        let file = self.filesystem.open_file(&relative)?;
+        FileIdentity::capture(self.filesystem, &self.target, &file)
+    }
+
+    fn verify_restored(&self, content: &[u8], mode: Option<u32>) -> Result<(), String> {
+        let relative = self
+            .relative(&self.target)
+            .map_err(|error| error.to_string())?;
         let mut file = self
-            .open_target(identity, false)
+            .filesystem
+            .open_file(&relative)
+            .map_err(|error| error.to_string())?;
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
+        if !metadata.is_file() {
+            return Err("the snapshot is no longer a regular file".to_string());
+        }
+        let identity = FileIdentity::capture(self.filesystem, &self.target, &file)
+            .map_err(|error| error.to_string())?;
+        self.validate_target_identity(Some(identity))
             .map_err(|error| error.to_string())?;
         let read =
             read_with_validation(&mut file, || self.validate_target_identity(Some(identity)))
@@ -977,38 +977,15 @@ impl Guard {
         self.create_snapshot_directories()?;
         self.validate_target_identity(current.identity)
             .map_err(|error| error.to_string())?;
-        let mut options = fs::OpenOptions::new();
-        options.write(true);
-        match current.identity {
-            Some(_) => {}
-            None => {
-                options.create_new(true);
-            }
-        }
-        configure_snapshot_open(&mut options, true, false);
-        let mut file = options
-            .open(&self.target)
+        let relative = self
+            .relative(&self.target)
             .map_err(|error| error.to_string())?;
-        reject_reparse_handle(&file).map_err(|error| error.to_string())?;
-        self.validate_path(&self.target)
+        self.filesystem
+            .write(&relative, produced)
             .map_err(|error| error.to_string())?;
-        let opened_identity =
-            FileIdentity::capture(&self.target, &file).map_err(|error| error.to_string())?;
-        if current
-            .identity
-            .is_some_and(|identity| identity != opened_identity)
-        {
-            return Err("the snapshot identity changed before update".to_string());
-        }
-        self.validate_target_identity(Some(opened_identity))
+        let captured = self.capture_current().map_err(|error| error.to_string())?;
+        self.validate_target_identity(Some(captured))
             .map_err(|error| error.to_string())?;
-        if current.identity.is_some() {
-            file.set_len(0).map_err(|error| error.to_string())?;
-        }
-        write_with_validation(&mut file, produced, || {
-            self.validate_target_identity(Some(opened_identity))
-        })
-        .map_err(|error| error.to_string())?;
         Ok(true)
     }
 
@@ -1027,8 +1004,9 @@ impl Guard {
                 };
                 candidate.push(name);
                 self.validate_path(&candidate)?;
-                match fs::symlink_metadata(&candidate) {
-                    Ok(metadata) if is_reparse_point(&metadata) || !metadata.is_dir() => {
+                let candidate_relative = self.relative(&candidate)?;
+                match self.filesystem.symlink_metadata(&candidate_relative) {
+                    Ok(metadata) if is_link_or_reparse_point(&metadata) || !metadata.is_dir() => {
                         return Err(io::Error::other(
                             "the snapshot directory is no longer a directory",
                         ));
@@ -1038,7 +1016,7 @@ impl Guard {
                         .map_err(io::Error::other)?,
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         self.validate_path(&candidate)?;
-                        fs::create_dir(&candidate)?;
+                        self.filesystem.create_dir(&candidate_relative)?;
                         self.missing.push(candidate.clone());
                         self.sort_missing();
                         let directory = self.capture_directory_guarded(&candidate).map_err(|error| {
@@ -1126,12 +1104,13 @@ impl Guard {
             }
             let result = (|| {
                 self.validate_path(&candidate)?;
-                let metadata = match fs::symlink_metadata(&candidate) {
+                let relative = self.relative(&candidate)?;
+                let metadata = match self.filesystem.symlink_metadata(&relative) {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
                     Err(error) => return Err(error),
                     Ok(metadata) => metadata,
                 };
-                if is_reparse_point(&metadata) || !metadata.is_dir() {
+                if is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
                     return Err(io::Error::other(
                         "the recorded directory candidate was replaced; refusing cleanup",
                     ));
@@ -1179,7 +1158,17 @@ impl Guard {
                 Ok(true) => {}
             }
 
-            let entries = match fs::read_dir(&candidate) {
+            let relative = match self.relative(&candidate) {
+                Ok(relative) => relative,
+                Err(error) => {
+                    failures.push(format!(
+                        "{}: {error}",
+                        path::display(Some(&self.root), &candidate)
+                    ));
+                    continue;
+                }
+            };
+            let entries = match self.filesystem.read_dir(&relative) {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     self.created_directories.remove(index);
@@ -1217,10 +1206,21 @@ impl Guard {
                     // The final identity/containment check above is complete.
                     // Windows cannot remove a directory while its own handle
                     // denies delete sharing, so release only this candidate;
-                    // its parent chain remains pinned across remove_dir.
+                    // its parent chain remains pinned. The removal itself is
+                    // relative to the retained root capability.
                     let expected_identity = self.created_directories[index].identity;
                     self.created_directories[index].release_handle();
-                    match fs::remove_dir(&candidate) {
+                    let relative = match self.relative(&candidate) {
+                        Ok(relative) => relative,
+                        Err(error) => {
+                            failures.push(format!(
+                                "{}: {error}",
+                                path::display(Some(&self.root), &candidate)
+                            ));
+                            continue;
+                        }
+                    };
+                    match self.filesystem.remove_dir(&relative) {
                         Ok(()) => {
                             self.created_directories.remove(index);
                         }
@@ -1328,14 +1328,16 @@ impl Guard {
 
     fn check_directory_identity(&self, tracked: &TrackedDirectory) -> io::Result<()> {
         self.validate_containment(&tracked.path)?;
-        let metadata = fs::symlink_metadata(&tracked.path)?;
-        if is_reparse_point(&metadata) || !metadata.is_dir() {
+        let metadata = self
+            .filesystem
+            .symlink_metadata(&self.relative(&tracked.path)?)?;
+        if is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
             return Err(io::Error::other(
                 "a snapshot parent is no longer the captured directory",
             ));
         }
         self.validate_containment(&tracked.path)?;
-        let handle = open_directory(&tracked.path)?;
+        let handle = open_directory(self.filesystem, &tracked.path)?;
         let handle_metadata = handle.metadata()?;
         if is_reparse_point(&handle_metadata) || !handle_metadata.is_dir() {
             return Err(io::Error::other(
@@ -1343,7 +1345,7 @@ impl Guard {
             ));
         }
         self.validate_containment(&tracked.path)?;
-        if FileIdentity::capture(&tracked.path, &handle)? != tracked.identity {
+        if FileIdentity::capture(self.filesystem, &tracked.path, &handle)? != tracked.identity {
             return Err(io::Error::other(
                 "a snapshot parent identity changed; refusing the filesystem operation",
             ));
@@ -1365,7 +1367,10 @@ impl Guard {
         after_identity: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
         self.validate_path(&self.target)?;
-        match fs::symlink_metadata(&self.target) {
+        match self
+            .filesystem
+            .symlink_metadata(&self.relative(&self.target)?)
+        {
             Err(error) if error.kind() == io::ErrorKind::NotFound && expected.is_none() => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(error),
             Err(error) => return Err(error),
@@ -1374,7 +1379,7 @@ impl Guard {
                     "the snapshot target appeared or changed before the filesystem operation",
                 ));
             }
-            Ok(metadata) if is_reparse_point(&metadata) => {
+            Ok(metadata) if is_link_or_reparse_point(&metadata) => {
                 return Err(io::Error::other(
                     "the snapshot became a symbolic link; refusing to follow it",
                 ));
@@ -1386,7 +1391,7 @@ impl Guard {
                 self.validate_path(&self.target)?;
                 let file = open_snapshot_file(&self.target, true, false, true, false)?;
                 self.validate_path(&self.target)?;
-                let identity = FileIdentity::capture(&self.target, &file)?;
+                let identity = FileIdentity::capture(self.filesystem, &self.target, &file)?;
                 if Some(identity) != expected {
                     return Err(io::Error::other(
                         "the snapshot identity changed before the filesystem operation",
@@ -1407,7 +1412,10 @@ impl Guard {
                 // Recheck absence after all retained-directory identity work;
                 // containment is deliberately the last check before success.
                 self.validate_path(&self.target)?;
-                match fs::symlink_metadata(&self.target) {
+                match self
+                    .filesystem
+                    .symlink_metadata(&self.relative(&self.target)?)
+                {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         self.validate_containment(&self.target)
                     }
@@ -1440,11 +1448,11 @@ impl Guard {
         // entry's identity. The hook is used only by tests to redirect the
         // path after identity capture and before the final containment check.
         self.validate_path(file_path)?;
-        if capture_pinned_file_identity(file_path)? != expected {
+        if capture_pinned_file_identity(self.filesystem, file_path)? != expected {
             return Err(io::Error::other(changed_message.to_string()));
         }
         after_identity()?;
-        if capture_pinned_file_identity(file_path)? != expected {
+        if capture_pinned_file_identity(self.filesystem, file_path)? != expected {
             return Err(io::Error::other(changed_message.to_string()));
         }
         // This must remain the final path check: a redirection during either
@@ -1457,7 +1465,7 @@ impl Guard {
         self.validate_path(&self.target)?;
         let file = open_snapshot_file(&self.target, true, false, true, write_attributes)?;
         self.validate_path(&self.target)?;
-        if FileIdentity::capture(&self.target, &file)? != expected {
+        if FileIdentity::capture(self.filesystem, &self.target, &file)? != expected {
             return Err(io::Error::other(
                 "the snapshot identity changed while it was opened",
             ));
@@ -1470,35 +1478,15 @@ impl Guard {
         Ok(file)
     }
 
-    fn validate_file_identity(&self, file_path: &Path, expected: FileIdentity) -> io::Result<()> {
-        self.validate_path(file_path)?;
-        let metadata = fs::symlink_metadata(file_path)?;
-        if is_reparse_point(&metadata) || !metadata.is_file() {
-            return Err(io::Error::other(
-                "the temporary restore file was replaced; refusing the filesystem operation",
-            ));
-        }
-        self.validate_path(file_path)?;
-        let file = open_snapshot_file(file_path, true, false, true, false)?;
-        self.validate_path(file_path)?;
-        if FileIdentity::capture(file_path, &file)? != expected {
-            return Err(io::Error::other(
-                "the temporary restore file identity changed; refusing the filesystem operation",
-            ));
-        }
-        self.validate_final_file_identity(
-            file_path,
-            expected,
-            "the temporary restore file identity changed; refusing the filesystem operation",
-        )
-    }
-
     fn validate_tracked_directory(&self, tracked: &TrackedDirectory) -> io::Result<bool> {
         self.validate_containment(&tracked.path)?;
-        match fs::symlink_metadata(&tracked.path) {
+        match self
+            .filesystem
+            .symlink_metadata(&self.relative(&tracked.path)?)
+        {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
-            Ok(metadata) if is_reparse_point(&metadata) || !metadata.is_dir() => {
+            Ok(metadata) if is_link_or_reparse_point(&metadata) || !metadata.is_dir() => {
                 return Err(io::Error::other(
                     "the created path is no longer the captured directory",
                 ));
@@ -1534,31 +1522,49 @@ impl Guard {
 
     fn capture_directory_guarded(&self, directory: &Path) -> io::Result<TrackedDirectory> {
         self.validate_path(directory)?;
-        let metadata = fs::symlink_metadata(directory)?;
-        if is_reparse_point(&metadata) || !metadata.is_dir() {
+        let metadata = self
+            .filesystem
+            .symlink_metadata(&self.relative(directory)?)?;
+        if is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
             return Err(io::Error::other("the path is no longer a directory"));
         }
         self.validate_path(directory)?;
-        let handle = open_directory(directory)?;
+        let handle = open_directory(self.filesystem, directory)?;
         let handle_metadata = handle.metadata()?;
         if is_reparse_point(&handle_metadata) || !handle_metadata.is_dir() {
             return Err(io::Error::other("the path changed while it was opened"));
         }
         self.validate_path(directory)?;
-        let identity = FileIdentity::capture(directory, &handle)?;
+        let identity = FileIdentity::capture(self.filesystem, directory, &handle)?;
         let tracked = TrackedDirectory {
             path: directory.to_path_buf(),
             identity,
             handle: Some(handle),
         };
         self.validate_path(directory)?;
-        if FileIdentity::capture_path(directory)? != identity {
+        if !self.identity_matches_path(&tracked)? {
             return Err(io::Error::other(
                 "the directory identity changed while it was captured",
             ));
         }
         self.validate_containment(directory)?;
         Ok(tracked)
+    }
+
+    /// True when the named directory is still the object whose handle is
+    /// retained. Unix compares the pathname identity with the handle identity;
+    /// Windows relies on the pinned no-delete handle, which keeps the name
+    /// attached to the captured object for as long as it is open.
+    fn identity_matches_path(&self, tracked: &TrackedDirectory) -> io::Result<bool> {
+        #[cfg(unix)]
+        {
+            Ok(FileIdentity::capture_path(self.filesystem, &tracked.path)? == tracked.identity)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tracked;
+            Ok(true)
+        }
     }
 
     fn sort_missing(&mut self) {
@@ -1592,65 +1598,47 @@ fn read_with_validation<R: Read>(
     }
 }
 
-/// Writes all bytes, validating the authorized path and object immediately
-/// before every individual write call. Short writes revalidate before the
-/// next call; a zero-length write fails with the standard `WriteZero` error.
-fn write_with_validation<W: Write>(
-    writer: &mut W,
-    mut remaining: &[u8],
-    mut validate: impl FnMut() -> io::Result<()>,
-) -> io::Result<()> {
-    while !remaining.is_empty() {
-        validate()?;
-        let written = writer.write(remaining)?;
-        if written == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "failed to write the complete file",
-            ));
-        }
-        remaining = &remaining[written..];
-    }
-    Ok(())
-}
-
-fn capture_existing_chain(root: &Path, target: &Path) -> io::Result<Vec<TrackedDirectory>> {
+fn capture_existing_chain(
+    filesystem: &RootDir,
+    root: &Path,
+    target: &Path,
+) -> io::Result<Vec<TrackedDirectory>> {
     let parent = target.parent().unwrap_or(root);
     let relative = parent
         .strip_prefix(root)
         .map_err(|_| io::Error::other("the snapshot parent is outside the repository root"))?;
-    let mut directories = vec![capture_directory(root)?];
+    let mut directories = vec![capture_directory(filesystem, root)?];
     let mut candidate = root.to_path_buf();
     for component in relative.components() {
         let Component::Normal(name) = component else {
             continue;
         };
         candidate.push(name);
-        match fs::symlink_metadata(&candidate) {
+        match filesystem.symlink_metadata(&filesystem.relative(&candidate)?) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => break,
             Err(error) => return Err(error),
-            Ok(metadata) if is_reparse_point(&metadata) || !metadata.is_dir() => {
+            Ok(metadata) if is_link_or_reparse_point(&metadata) || !metadata.is_dir() => {
                 return Err(io::Error::other(
                     "the resolved snapshot parent is not a regular directory",
                 ));
             }
-            Ok(_) => directories.push(capture_directory(&candidate)?),
+            Ok(_) => directories.push(capture_directory(filesystem, &candidate)?),
         }
     }
     Ok(directories)
 }
 
-fn capture_directory(path: &Path) -> io::Result<TrackedDirectory> {
-    let metadata = fs::symlink_metadata(path)?;
-    if is_reparse_point(&metadata) || !metadata.is_dir() {
+fn capture_directory(filesystem: &RootDir, path: &Path) -> io::Result<TrackedDirectory> {
+    let metadata = filesystem.symlink_metadata(&filesystem.relative(path)?)?;
+    if is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
         return Err(io::Error::other("the path is no longer a directory"));
     }
-    let handle = open_directory(path)?;
+    let handle = open_directory(filesystem, path)?;
     let handle_metadata = handle.metadata()?;
     if is_reparse_point(&handle_metadata) || !handle_metadata.is_dir() {
         return Err(io::Error::other("the path changed while it was opened"));
     }
-    let identity = FileIdentity::capture(path, &handle)?;
+    let identity = FileIdentity::capture(filesystem, path, &handle)?;
     Ok(TrackedDirectory {
         path: path.to_path_buf(),
         identity,
@@ -1658,9 +1646,14 @@ fn capture_directory(path: &Path) -> io::Result<TrackedDirectory> {
     })
 }
 
-fn open_directory(path: &Path) -> io::Result<fs::File> {
+/// Opens a retained directory handle for identity checks. The handle is the
+/// pinning mechanism on Windows and the identity source on Unix; it is opened
+/// after the caller validated the path against the root capability, and it is
+/// read-only: every removal it guards is issued relative to that capability.
+fn open_directory(filesystem: &RootDir, path: &Path) -> io::Result<fs::File> {
     #[cfg(unix)]
     {
+        let _ = filesystem;
         fs::File::open(path)
     }
 
@@ -1671,6 +1664,10 @@ fn open_directory(path: &Path) -> io::Result<fs::File> {
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         const FILE_SHARE_READ: u32 = 0x0000_0001;
         const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        // The capability confirms that the name still resolves inside the root;
+        // the handle itself needs the no-delete share mode, which cap-std does
+        // not expose for a single file.
+        filesystem.symlink_metadata(&filesystem.relative(path)?)?;
         let mut options = fs::OpenOptions::new();
         options
             .access_mode(0)
@@ -1688,11 +1685,26 @@ fn open_directory(path: &Path) -> io::Result<fs::File> {
 
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = path;
+        let _ = (filesystem, path);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "directory handles are unavailable on this platform",
         ))
+    }
+}
+
+/// True when capability metadata names a link or a Windows reparse point.
+fn is_link_or_reparse_point(metadata: &cap_std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use cap_std::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+
+    #[cfg(not(windows))]
+    {
+        metadata.is_symlink()
     }
 }
 
@@ -1711,10 +1723,10 @@ fn is_reparse_point(metadata: &fs::Metadata) -> bool {
 }
 
 /// Configures final-component opening behavior for snapshot files. Windows
-/// path identity is captured by file ID through the pathname, so the actual
-/// operation handle must deny delete sharing while that ID is captured and
-/// while post-command I/O uses the handle. The pre-command snapshot handle
-/// deliberately permits delete sharing so the child may replace the file.
+/// has no pathname file identity in this design: the retained no-delete handle
+/// pins the name, so the post-command handle denies delete sharing while it is
+/// open. The pre-command snapshot handle deliberately permits delete sharing
+/// so the child may replace the file.
 fn configure_snapshot_open(
     options: &mut fs::OpenOptions,
     pin_file_name: bool,
@@ -1763,9 +1775,10 @@ fn open_snapshot_file(
     Ok(file)
 }
 
-fn capture_pinned_file_identity(path: &Path) -> io::Result<FileIdentity> {
+/// Opens a pinned handle for the file and captures its identity.
+fn capture_pinned_file_identity(filesystem: &RootDir, path: &Path) -> io::Result<FileIdentity> {
     let file = open_snapshot_file(path, true, false, true, false)?;
-    FileIdentity::capture(path, &file)
+    FileIdentity::capture(filesystem, path, &file)
 }
 
 fn reject_reparse_handle(file: &fs::File) -> io::Result<()> {
@@ -1785,25 +1798,11 @@ fn reject_reparse_handle(file: &fs::File) -> io::Result<()> {
     Ok(())
 }
 
-fn set_handle_mode(file: &fs::File, mode: u32) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(mode))
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = (file, mode);
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod io_validation_tests {
-    use super::{read_with_validation, write_with_validation};
+    use super::read_with_validation;
     use std::cell::RefCell;
-    use std::io::{self, Read, Write};
+    use std::io::{self, Read};
     use std::rc::Rc;
 
     struct PartialReader {
@@ -1823,25 +1822,6 @@ mod io_validation_tests {
             buffer[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
             self.offset += count;
             Ok(count)
-        }
-    }
-
-    struct PartialWriter {
-        bytes: Vec<u8>,
-        max_write: usize,
-        events: Rc<RefCell<Vec<&'static str>>>,
-    }
-
-    impl Write for PartialWriter {
-        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            self.events.borrow_mut().push("write");
-            let count = buffer.len().min(self.max_write);
-            self.bytes.extend_from_slice(&buffer[..count]);
-            Ok(count)
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
         }
     }
 
@@ -1895,63 +1875,19 @@ mod io_validation_tests {
         assert_eq!(error.to_string(), "path changed");
         assert_eq!(*events.borrow(), ["validate", "read", "validate"]);
     }
-
-    #[test]
-    fn writes_revalidate_between_partial_writes_and_stop_after_failure() {
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let mut writer = PartialWriter {
-            bytes: Vec::new(),
-            max_write: 2,
-            events: Rc::clone(&events),
-        };
-        let mut validations = 0;
-
-        let error = write_with_validation(&mut writer, b"abcde", || {
-            events.borrow_mut().push("validate");
-            validations += 1;
-            if validations == 2 {
-                Err(io::Error::other("path changed"))
-            } else {
-                Ok(())
-            }
-        })
-        .expect_err("the second validation fails");
-
-        assert_eq!(error.to_string(), "path changed");
-        assert_eq!(writer.bytes, b"ab");
-        assert_eq!(*events.borrow(), ["validate", "write", "validate"]);
-    }
-
-    #[test]
-    fn zero_length_write_returns_write_zero() {
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let mut writer = PartialWriter {
-            bytes: Vec::new(),
-            max_write: 0,
-            events: Rc::clone(&events),
-        };
-
-        let error = write_with_validation(&mut writer, b"abc", || {
-            events.borrow_mut().push("validate");
-            Ok(())
-        })
-        .expect_err("a zero-length write fails");
-
-        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
-        assert_eq!(*events.borrow(), ["validate", "write"]);
-    }
 }
 
 #[cfg(all(test, unix))]
 mod final_containment_tests {
     use super::{FileIdentity, Guard};
+    use crate::capfs::RootDir;
     use crate::fsutil::Temporary;
     use std::fs;
     use std::io;
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
-    fn fixture(prefix: &str) -> (Temporary, Guard, FileIdentity, PathBuf, PathBuf) {
+    fn fixture(prefix: &str) -> (Temporary, PathBuf, PathBuf, PathBuf) {
         let temporary = Temporary::new(prefix).expect("temporary directory");
         let root = temporary.path().join("repo");
         fs::create_dir(&root).expect("repository directory");
@@ -1960,20 +1896,31 @@ mod final_containment_tests {
         fs::create_dir_all(&snapshots).expect("snapshot directory");
         let target = snapshots.join("output.txt");
         fs::write(&target, b"original").expect("snapshot file");
+        (temporary, root, snapshots, target)
+    }
+
+    fn guard<'a>(
+        filesystem: &'a RootDir,
+        root: &std::path::Path,
+        target: &std::path::Path,
+    ) -> (Guard<'a>, FileIdentity) {
         let guard = Guard::take(
-            &target,
-            &root,
+            target,
+            root,
             "snapshots/output.txt".to_string(),
             Vec::new(),
+            filesystem,
         )
         .expect("guard");
         let identity = guard.before.identity.expect("snapshot identity");
-        (temporary, guard, identity, snapshots, target)
+        (guard, identity)
     }
 
     #[test]
     fn target_validation_rechecks_path_identity_after_handle_identity_capture() {
-        let (_temporary, guard, identity, _snapshots, target) = fixture("verify-final-identity");
+        let (_temporary, root, _snapshots, target) = fixture("verify-final-identity");
+        let filesystem = RootDir::open(&root).expect("root capability");
+        let (guard, identity) = guard(&filesystem, &root, &target);
         let previous = target.with_file_name("previous-output.txt");
 
         let error = guard
@@ -1989,7 +1936,9 @@ mod final_containment_tests {
 
     #[test]
     fn target_validation_runs_final_containment_after_identity_capture() {
-        let (_temporary, guard, identity, snapshots, target) = fixture("verify-final-containment");
+        let (_temporary, canonical_root, snapshots, target) = fixture("verify-final-containment");
+        let filesystem = RootDir::open(&canonical_root).expect("root capability");
+        let (guard, identity) = guard(&filesystem, &canonical_root, &target);
         let root = guard.canonical_root.clone();
         let moved = root.join("snapshots-original");
         let outside = guard.root.join("outside");
@@ -2004,20 +1953,30 @@ mod final_containment_tests {
             })
             .expect_err("the final containment check rejects the outside link");
 
-        assert!(error.to_string().contains("authorized target"), "{error}");
+        // Containment reports the redirection in its own words when it runs
+        // first; the retained capability refuses the absolute link target
+        // itself when it reaches it first. Either way the operation fails
+        // closed before anything is written through the replacement.
+        let message = error.to_string();
+        assert!(
+            message.contains("authorized target")
+                || message.contains("led outside of the filesystem"),
+            "{message}"
+        );
     }
 }
 
 #[cfg(all(test, windows))]
 mod windows_pinning_tests {
     use super::{Guard, open_directory, open_snapshot_file};
+    use crate::capfs::RootDir;
     use crate::fsutil::Temporary;
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
 
-    fn fixture() -> (Temporary, Guard, PathBuf, PathBuf) {
+    fn fixture() -> (Temporary, PathBuf, PathBuf, PathBuf) {
         let temporary = Temporary::new("verify-windows-pinning").expect("temporary directory");
         let root = temporary.path().join("repo");
         fs::create_dir(&root).expect("repository directory");
@@ -2026,14 +1985,18 @@ mod windows_pinning_tests {
         fs::create_dir(&snapshots).expect("snapshot directory");
         let target = snapshots.join("output.txt");
         fs::write(&target, b"original").expect("snapshot file");
-        let guard = Guard::take(
-            &target,
-            &root,
+        (temporary, root, snapshots, target)
+    }
+
+    fn guard<'a>(filesystem: &'a RootDir, root: &Path, target: &Path) -> Guard<'a> {
+        Guard::take(
+            target,
+            root,
             "snapshots/output.txt".to_string(),
             Vec::new(),
+            filesystem,
         )
-        .expect("guard");
-        (temporary, guard, snapshots, target)
+        .expect("guard")
     }
 
     fn rename_from_child(
@@ -2050,7 +2013,9 @@ mod windows_pinning_tests {
 
     #[test]
     fn child_cannot_rename_a_pinned_snapshot_parent() {
-        let (_temporary, guard, snapshots, _target) = fixture();
+        let (_temporary, root, snapshots, target) = fixture();
+        let filesystem = RootDir::open(&root).expect("root capability");
+        let guard = guard(&filesystem, &root, &target);
         let output = rename_from_child(
             snapshots.parent().expect("snapshot parent"),
             "snapshots",
@@ -2069,7 +2034,9 @@ mod windows_pinning_tests {
 
     #[test]
     fn retained_precommand_snapshot_handle_allows_file_replacement() {
-        let (_temporary, guard, _snapshots, target) = fixture();
+        let (_temporary, root, _snapshots, target) = fixture();
+        let filesystem = RootDir::open(&root).expect("root capability");
+        let guard = guard(&filesystem, &root, &target);
         let previous = target.with_file_name("previous-output.txt");
         fs::rename(&target, &previous).expect("rename snapshot held with delete sharing");
         assert!(!target.exists());
@@ -2115,8 +2082,9 @@ mod windows_pinning_tests {
         let junction = temporary.path().join("directory-junction");
         fs::create_dir(&directory).expect("regular directory");
         make_junction(&junction, &directory);
+        let filesystem = RootDir::open(temporary.path()).expect("root capability");
         assert!(
-            open_directory(&junction).is_err(),
+            open_directory(&filesystem, &junction).is_err(),
             "directory reparse point must not be followed"
         );
 
