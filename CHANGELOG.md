@@ -117,3 +117,9 @@ block is written by `ratchet release`.
 ### Fixed
 
 - exclude git-ignored paths by default (#26) (file-metrics)
+
+## [0.7.0] - 2026-11-17
+
+### Added
+
+- contain filesystem operations in a capability root (#29) (engine)
