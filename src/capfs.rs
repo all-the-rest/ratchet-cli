@@ -99,34 +99,47 @@ impl RootDir {
     /// Opens and tracks an existing directory. Used only for identity checks
     /// in tests and for capturing a directory immediately after creation.
     pub fn track_dir(&self, path: &Path) -> io::Result<TrackedDir> {
-        let handles = self.open_directory_chain(path)?;
-        let handle = handles.last().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the repository root is not a child",
-            )
-        })?;
-        let metadata = handle.dir_metadata()?;
-        if !metadata.is_dir() {
-            return Err(io::Error::other(
-                "the created path is no longer a directory",
-            ));
-        }
-        let identity = DirectoryIdentity::capture(&metadata)?;
         #[cfg(windows)]
-        let name = path.file_name().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the directory has no final name",
-            )
-        })?;
-        Ok(TrackedDir {
-            path: path.to_path_buf(),
-            #[cfg(windows)]
-            name: name.to_os_string(),
-            identity,
-            handles,
-        })
+        {
+            let pin = self.pin_directory(path)?;
+            if !pin.metadata()?.is_dir() {
+                return Err(io::Error::other(
+                    "the created path is no longer a directory",
+                ));
+            }
+            let metadata = self.dir.symlink_metadata(path)?;
+            if !metadata.is_dir() {
+                return Err(io::Error::other(
+                    "the created path is no longer a directory",
+                ));
+            }
+            Ok(TrackedDir {
+                path: path.to_path_buf(),
+                pin: Some(pin),
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let handles = self.open_directory_chain(path)?;
+            let handle = handles.last().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the repository root is not a child",
+                )
+            })?;
+            let metadata = handle.dir_metadata()?;
+            if !metadata.is_dir() {
+                return Err(io::Error::other(
+                    "the created path is no longer a directory",
+                ));
+            }
+            let identity = DirectoryIdentity::capture(&metadata)?;
+            Ok(TrackedDir {
+                path: path.to_path_buf(),
+                identity,
+                handles,
+            })
+        }
     }
 
     /// Creates an empty directory through the root capability.
@@ -263,26 +276,45 @@ impl RootDir {
         self.dir.remove_dir(path)
     }
 
-    /// Rechecks the captured directory and removes it if empty. On Unix the
-    /// captured handles are dropped before root-relative `remove_dir`. On
-    /// Windows the leaf handle is dropped for the capability-relative removal
-    /// and the whole chain is released once the directory is gone, so an
-    /// ancestor held open by another tracked child can be removed in turn. A
+    /// Rechecks the captured directory and removes it if empty.
+    ///
+    /// On Unix the captured handles are dropped before the root-relative
+    /// `remove_dir`. On Windows the retained pin holds a handle with the
+    /// operating system's default share mode, so it never blocks the removal;
+    /// it is released once the directory is gone so Windows completes the
+    /// deferred deletion and an ancestor can be removed in turn. Before each
+    /// removal attempt the pin's object is compared with the object the path
+    /// names now, so a replacement at the tracked name is refused. A
     /// replacement in the final check-to-operation interval remains the
     /// documented narrow race.
     pub fn remove_tracked_dir(&self, directory: &mut TrackedDir) -> io::Result<bool> {
         if !self.verify_tracked_dir(directory)? {
             return Ok(false);
         }
-        let mut entries = directory
-            .handles
-            .last()
-            .ok_or_else(|| io::Error::other("the tracked directory handle is missing"))?
-            .entries()?;
-        match entries.next() {
-            None => {}
-            Some(Ok(_)) => return Ok(false),
-            Some(Err(error)) => return Err(error),
+        #[cfg(windows)]
+        let empty = {
+            let mut entries = self.dir.read_dir(&directory.path)?;
+            match entries.next() {
+                None => true,
+                Some(Ok(_)) => false,
+                Some(Err(error)) => return Err(error),
+            }
+        };
+        #[cfg(not(windows))]
+        let empty = {
+            let mut entries = directory
+                .handles
+                .last()
+                .ok_or_else(|| io::Error::other("the tracked directory handle is missing"))?
+                .entries()?;
+            match entries.next() {
+                None => true,
+                Some(Ok(_)) => false,
+                Some(Err(error)) => return Err(error),
+            }
+        };
+        if !empty {
+            return Ok(false);
         }
         if !self.verify_tracked_dir(directory)? {
             return Ok(false);
@@ -290,16 +322,12 @@ impl RootDir {
 
         #[cfg(windows)]
         let removed = {
-            let parent_index = directory.handles.len().checked_sub(2).ok_or_else(|| {
-                io::Error::other("the tracked directory has no retained parent capability")
-            })?;
-            directory.handles.pop();
-            let removed = directory.handles[parent_index].remove_dir(&directory.name);
-            // Windows refuses to remove a directory that still has an open
-            // handle. Another tracked child can still hold an ancestor of this
-            // directory open, so release the whole chain once the leaf is gone.
+            let removed = self.dir.remove_dir(&directory.path);
             if removed.is_ok() {
-                directory.handles.clear();
+                // The pin opens with delete sharing, so it never blocked the
+                // removal. Releasing it now lets Windows finish the deferred
+                // deletion.
+                drop(directory.pin.take());
             }
             removed
         };
@@ -318,17 +346,7 @@ impl RootDir {
 
     /// Verifies that the path still resolves to the tracked directory.
     pub fn verify_tracked_dir(&self, directory: &TrackedDir) -> io::Result<bool> {
-        #[cfg(windows)]
-        let metadata = {
-            let parent_index = directory.handles.len().checked_sub(2).ok_or_else(|| {
-                io::Error::other("the tracked directory has no retained parent capability")
-            })?;
-            directory.handles[parent_index].symlink_metadata(&directory.name)
-        };
-        #[cfg(not(windows))]
-        let metadata = self.dir.symlink_metadata(&directory.path);
-
-        let metadata = match metadata {
+        let metadata = match self.dir.symlink_metadata(&directory.path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
@@ -338,14 +356,61 @@ impl RootDir {
                 "the created path is no longer a directory; refusing cleanup",
             ));
         }
-        if !directory.identity.matches(&metadata)? {
-            return Err(io::Error::other(
-                "the directory identity changed; refusing cleanup",
-            ));
+        #[cfg(windows)]
+        {
+            // The pin no longer denies rename or delete, so the object it
+            // refers to is compared with the object the path names now. Both
+            // metadata records are read live, so legitimate changes to the
+            // directory's contents cannot make them differ.
+            let Some(pin) = directory.pin.as_ref() else {
+                return Ok(false);
+            };
+            if !same_windows_directory(&pin.metadata()?, &metadata) {
+                return Err(io::Error::other(
+                    "the directory identity changed; refusing cleanup",
+                ));
+            }
+            Ok(true)
         }
-        Ok(true)
+        #[cfg(not(windows))]
+        {
+            if !directory.identity.matches(&metadata)? {
+                return Err(io::Error::other(
+                    "the directory identity changed; refusing cleanup",
+                ));
+            }
+            Ok(true)
+        }
     }
 
+    /// Opens a Windows pin handle that keeps the operating system's default
+    /// share mode (read, write and delete).
+    ///
+    /// The handle is opened relative to the retained root capability, but with
+    /// no access rights and without cap-std's directory flag. cap-std strips
+    /// `FILE_SHARE_DELETE` from directory opens, and such a handle would make a
+    /// generator's own rename or removal of the directory fail. Keeping delete
+    /// sharing means the pin never blocks cleanup either; it only keeps the
+    /// tracked object alive so the identity check can compare it with whatever
+    /// the path names now. The pin never reads or writes through the name.
+    #[cfg(windows)]
+    fn pin_directory(&self, path: &Path) -> io::Result<fs::File> {
+        use cap_std::fs::OpenOptionsExt;
+
+        // FILE_FLAG_BACKUP_SEMANTICS permits opening a directory handle.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+        self.dir
+            .open_with(
+                path,
+                OpenOptions::new()
+                    .access_mode(0)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS),
+            )
+            .map(|file| file.into_std())
+    }
+
+    #[cfg(not(windows))]
     fn open_directory_chain(&self, path: &Path) -> io::Result<Vec<Dir>> {
         let mut handles = vec![self.dir.open_dir(".")?];
         for component in path.components() {
@@ -376,16 +441,24 @@ impl RootDir {
     }
 }
 
-/// Identity and retained directory handles for an engine-created directory.
+/// Identity and retained handles for an engine-created directory.
 #[derive(Debug)]
 pub struct TrackedDir {
     path: PathBuf,
-    #[cfg(windows)]
-    name: std::ffi::OsString,
+    // On Unix every component stays open as a capability, so lookups and the
+    // final emptiness check are issued relative to the tracked parent. Identity
+    // is the device and inode of the leaf, so a rename does not confuse it.
+    #[cfg(not(windows))]
     identity: DirectoryIdentity,
-    // On Windows cap-std omits FILE_SHARE_DELETE for directory handles. Keeping
-    // every component open pins the lookup chain until final cleanup validation.
+    #[cfg(not(windows))]
     handles: Vec<Dir>,
+    // On Windows a handle keeps the object alive until cleanup, and its
+    // metadata is compared with the path's metadata to detect a replacement.
+    // The handle keeps the operating system's default share mode (read, write
+    // and delete), so a generator can still rename or remove the directory it
+    // created.
+    #[cfg(windows)]
+    pin: Option<fs::File>,
 }
 
 impl TrackedDir {
@@ -395,14 +468,35 @@ impl TrackedDir {
     }
 }
 
+/// Compares the tracked object's live metadata with the metadata the path
+/// resolves to now.
+///
+/// Creation time alone is not enough: Windows file-system tunneling restores
+/// it when a name is deleted and recreated shortly afterwards. The last write
+/// time is not subject to tunneling, and both records describe the same live
+/// object unless the path was replaced.
+#[cfg(windows)]
+fn same_windows_directory(pin: &fs::Metadata, current: &Metadata) -> bool {
+    use cap_std::fs::MetadataExt as CapMetadataExt;
+    use std::os::windows::fs::MetadataExt as StdMetadataExt;
+
+    pin.file_attributes() == current.file_attributes()
+        && pin.creation_time() == current.creation_time()
+        && pin.last_write_time() == current.last_write_time()
+        && pin.file_size() == current.file_size()
+}
+
+/// Identity of an engine-created directory on platforms that track one.
+///
+/// Windows tracks a retained handle instead (see `TrackedDir::pin`).
+#[cfg(not(windows))]
 #[derive(Debug, Clone, Copy)]
 enum DirectoryIdentity {
     #[cfg(unix)]
     Unix { device: u64, inode: u64 },
-    #[cfg(windows)]
-    WindowsPinned,
 }
 
+#[cfg(not(windows))]
 impl DirectoryIdentity {
     fn capture(metadata: &Metadata) -> io::Result<Self> {
         #[cfg(unix)]
@@ -413,12 +507,7 @@ impl DirectoryIdentity {
                 inode: metadata.ino(),
             })
         }
-        #[cfg(windows)]
-        {
-            let _ = metadata;
-            Ok(Self::WindowsPinned)
-        }
-        #[cfg(not(any(unix, windows)))]
+        #[cfg(not(unix))]
         {
             let _ = metadata;
             Err(io::Error::new(
@@ -435,14 +524,7 @@ impl DirectoryIdentity {
             let Self::Unix { device, inode } = self;
             Ok(metadata.dev() == device && metadata.ino() == inode)
         }
-        #[cfg(windows)]
-        {
-            let _ = (self, metadata);
-            // The held capability chain pins each opened directory against
-            // rename/replacement until the final root-relative removal.
-            Ok(true)
-        }
-        #[cfg(not(any(unix, windows)))]
+        #[cfg(not(unix))]
         {
             let _ = (self, metadata);
             Err(io::Error::new(

@@ -1610,7 +1610,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_directory_cleanup_uses_retained_capabilities() {
+    fn windows_directory_cleanup_releases_delete_sharing_pins() {
         let root = crate::test_tempdir::TempDir::new().expect("a temporary root");
         let filesystem = filesystem(&root);
         let mut created = vec![
