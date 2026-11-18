@@ -12,12 +12,18 @@ declared direction — or, deliberately and with a reason, against it.
 3. A **ceiling** rule fails when the count rises above its baseline; a
    **floor** rule fails when the count falls below it.
 4. The baseline itself moves in the declared direction: a ceiling may only
-   decrease, a floor may only increase. Raising a ceiling to make a gate green
-   is a **failed gate**, not a fix — the one exception is a deliberate raise
-   that carries its reason into the diff.
-5. The baseline moves only when a human says so, never automatically: in the
-   declared direction by `ratchet baseline update`, against it only by
-   `ratchet baseline raise`.
+   decrease, a floor may only increase. Moving it **against** that direction
+   to make a gate green is a **failed gate**, not a fix — that move needs a
+   deliberate raise with a reason.
+5. By default a rule is an **auto ratchet**: `ratchet check` tightens its
+   baseline in the improving direction *on a green run* and writes the new
+   value into the baseline file. More tests raise the test-count floor by
+   themselves, every subsequent run protects them; a regression cannot hide
+   behind a stale baseline. A rule that should stay at a **constant limit** —
+   a maximum line length, an architecture rule — declares
+   `"baseline": "fixed"`; it never moves on its own. `ratchet check
+   --no-ratchet` runs the gates without writing a baseline (for CI jobs that
+   must not mutate the tree).
 
 The engine owns the baseline, the direction, the monotonicity and the
 reporting. The project owns the counting: a rule produces its number through a
@@ -56,7 +62,8 @@ supported image sets the floor for every consumer.
 
 ```sh
 ratchet                 # the same as `ratchet check`
-ratchet check           # run every gate
+ratchet check           # run every gate; auto rules tighten their baseline
+ratchet check --no-ratchet # run the gates without writing the baseline
 ratchet check src/      # run the gates whose scope touches src/
 ratchet check --tier fast # run the gates of one tier
 ratchet count           # print the current count per rule
@@ -82,7 +89,7 @@ locally, then open a PR that closes the issue:
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo build && ./target/debug/ratchet check
+cargo build && ./target/debug/ratchet check --no-ratchet
 ```
 
 The checks run on pull requests and on `merge_group`; merge through the queue,
@@ -203,6 +210,9 @@ root.
         "unit": "call sites",
         // The allowed direction of the baseline: "ceiling" or "floor".
         "direction": "ceiling",
+        // "auto" (default): check tightens the baseline on a green run.
+        // "fixed": a constant limit; check never moves it.
+        "baseline": "auto",
         // Which tier the rule belongs to; "fast" (default) or "slow".
         "tier": "fast",
         // How the count is produced: a command (no shell) or a JSON file.
@@ -240,6 +250,17 @@ root.
   }
 ]
 ```
+
+`baseline` is `"auto"` by default. This is a deliberate breaking change from
+earlier releases, where every baseline stayed put until `baseline update`:
+projects that relied on a constant limit must now declare `"baseline":
+"fixed"` explicitly. In auto mode a `ceiling` whose count sinks is lowered to
+the new count, and a `floor` whose count rises is raised to it — the baseline
+is the value the code already has, so the next run protects it. The write
+happens only after a **coherent green run**; a failed run, a counter error and
+an unwritable baseline file leave the file untouched and fail the run. An auto
+rule cannot be moved against its direction with `baseline raise`: that is what
+`fixed` is for. `--no-ratchet` suppresses the write for one run.
 
 An unknown field anywhere — in a config object, in a rule or in a counter — is
 a **configuration error** (exit code 2) that names the offending path, e.g.
@@ -800,20 +821,23 @@ names the directory left behind and says that the working tree was modified.
 }
 ```
 
-The `reason` is optional — but it is more than an explanation: it is what
-makes a **deliberate move against the declared direction** reviewable. The
-reason travels with the record, so the diff on the baseline file carries it.
+The `reason` is optional for a move in the improving direction, but it is more
+than an explanation for a move **against** it: it is what makes a deliberate
+raise reviewable. The reason travels with the record, so the diff on the
+baseline file carries it. A step of an auto ratchet needs no reason — it is
+not a decision, it is the current count; its diff is machine-written. An
+automatic step leaves an existing reason in place.
 
 ## The commands
 
 | Command | What it does |
 |---|---|
-| `ratchet [check] [paths…]` | Runs every gate and compares the count with the baseline. The default command. `paths…` restricts the run to the rules whose `files` scope touches them; a path that does not exist is an operational error. |
+| `ratchet [check] [paths…]` | Runs every gate and compares the count with the baseline. A green run tightens the baselines of `auto` rules and writes them; `--no-ratchet` suppresses the write. The default command. `paths…` restricts the run to the rules whose `files` scope touches them; a path that does not exist is an operational error. |
 | `ratchet count` | Prints the current count per rule, without a comparison. |
 | `ratchet baseline init` | Writes the current count as the baseline of every rule that has none. Existing baselines are never touched. Without `--strict` it **documents** stale records and leaves them be; with `--strict` it refuses **before writing** if any stale artifact exists. |
-| `ratchet baseline update` | Moves the baseline towards the current count — **only** in the allowed direction. A ceiling may only decrease, a floor may only increase. A rule that may not move is reported as refused and left alone. It is also the cleanup step: it **prunes** stale rule and scope records. |
+| `ratchet baseline update` | Moves baselines towards the current count — **only** in the allowed direction (a ceiling down, a floor up). For `auto` rules this is the same step `check` takes when it runs; for `fixed` rules it is the manual step. A rule that may not move is reported as refused and left alone. It is also the cleanup step: it **prunes** stale rule and scope records. |
 | `ratchet baseline path` | Prints the **repository-relative path** of the baseline file — the path the binary itself uses, and nothing else. It is the answer to "which file is my baseline?" for a script outside the binary: the resolution lives in one place, and a second implementation answers a different question than the binary. |
-| `ratchet baseline raise` | Moves a baseline **against** its declared direction, on purpose, with a reason. A ceiling goes up, a floor goes down. The reason is required, and it travels with the record — see below. |
+| `ratchet baseline raise` | Moves a `fixed` baseline **against** its declared direction, on purpose, with a reason. A ceiling goes up, a floor goes down. The reason is required, and it travels with the record — see below. An `auto` rule refuses a raise; declare it `fixed` for a deliberate constant limit. |
 | `ratchet drift` | Runs the drift gates — the generated files — and nothing else. `--path` restricts the run to one generated file. |
 | `ratchet verify` | Runs the pre-release checks — the commands of the `verify` entries against their committed snapshots — and nothing else. `--name` restricts the run to one check, `--update` writes the produced output into the snapshots. See [the pre-release check](#the-pre-release-check). |
 | `ratchet report` | Renders the run into a **Markdown report**: the summary with the verdict, one row per rule, the findings that count and the notes of the run. The drift gates are not in it — a report that held the result of the comparison with itself would be a regress. `--output <path>` writes it into the repository instead of stdout. See [the Markdown report](#the-markdown-report). |
@@ -864,9 +888,13 @@ ratchet baseline raise --rule dependency-count --value 8 --reason "the self-upda
 and touches nothing else.
 
 * The move must be **against** the declared direction: a ceiling goes **up**, a
-  floor goes **down**. A move in the allowed direction is the paydown's job —
-  `ratchet baseline update` does it, and `baseline raise` refuses it: *"that is
-  the paydown — use `ratchet baseline update`"*.
+  floor goes **down**. A move in the allowed direction is the ratchet's job —
+  `check` or `ratchet baseline update` does it, and `baseline raise` refuses
+  it: *"that is the ratchet — use `ratchet baseline update`"*.
+* An **`auto` rule refuses a raise**: its baseline is the count the code has,
+  and a weaker value would be a regression, not a decision. A rule that needs
+  to be deliberately held at a weaker value must declare `"baseline":
+  "fixed"` — then `baseline raise` works as before.
 * The **reason is required**. A raise without one is refused like any other
   forbidden move, and the baseline file stays untouched.
 * The reason **travels with the record**: it is written into
@@ -877,8 +905,8 @@ and touches nothing else.
 The monotonicity check accepts a raise that carries a reason — the reason is in
 the file and therefore in the diff. A raise without a reason is rejected like
 any other forbidden move (`baseline-raised` / `baseline-lowered`, exit `1`).
-`baseline update` keeps its shape: it moves only in the allowed direction and
-refuses the other.
+`check` and `baseline update` keep their shape: they move only in the allowed
+direction and never write a weaker value.
 
 ### The tiers
 
@@ -1193,7 +1221,10 @@ drifts does not change it.
 `--output <path>` writes the file; the path is relative to the repository
 root, and a path outside it is an operational error. The command writes that
 one file and touches nothing else: the directory of the report has to exist —
-the command does not create it.
+the command does not create it. A report **never writes the baseline** —
+only `check` does that, and only on a green run. A report can itself be a
+drift generator, so writing a baseline from it would mutate the tree from
+inside a gate that promises not to.
 
 **The report is drift-checked like every other derived artifact.** The project
 registers it in `generated[]`, and the drift gate compares the committed file

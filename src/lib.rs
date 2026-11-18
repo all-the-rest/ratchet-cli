@@ -38,7 +38,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::baseline::{Baseline, BaselineRecord};
 use crate::check::{ActionKind, BaselineAction, Report};
-use crate::config::{CONFIG_FILE_NAMES, Config, DEFAULT_BASELINE_FILE, Direction, Rule, Tier};
+use crate::config::{
+    BaselineMode, CONFIG_FILE_NAMES, Config, DEFAULT_BASELINE_FILE, Direction, Rule, Tier,
+};
 use crate::git::Git;
 
 /// The name of the config `ratchet init` writes.
@@ -226,7 +228,7 @@ fn cmd_check(cli: &Cli, args: &CheckArgs, cwd: &Path) -> Result<i32, Error> {
     ensure_paths_exist(&args.paths, cwd, &context.root)?;
 
     let paths = check::selected_paths(&args.paths, cwd, &context.root);
-    let report = run_gates(
+    let mut report = run_gates(
         cli,
         &context,
         &Run {
@@ -234,8 +236,19 @@ fn cmd_check(cli: &Cli, args: &CheckArgs, cwd: &Path) -> Result<i32, Error> {
             tier: args.tier,
             fix: args.fix,
             drift: true,
+            no_ratchet: args.no_ratchet,
         },
     )?;
+    // A failed run, a dry run and a run without an improvement never touch
+    // the baseline.  A failure to write is a failure of the command: fail
+    // closed instead of reporting a green check over a stale baseline.  The
+    // same decision settles what the output shows: a value that is not
+    // written is not displayed as the baseline either.
+    let persist = !args.no_ratchet && report.ok;
+    if persist {
+        persist_baseline_updates(&context, &report)?;
+    }
+    report.settle_baseline(persist);
     match format_of(cli)? {
         Output::Json => println!("{}", report::render_json(&report)),
         Output::Stylish => print!("{}", report::render_stylish(&report, cli.quiet)),
@@ -261,6 +274,8 @@ struct Run<'a> {
     /// files, and the report — which is a generated file — cannot be part of
     /// a comparison with itself (SPEC 14).
     drift: bool,
+    /// Do not tighten auto baselines: `check --no-ratchet`.
+    no_ratchet: bool,
 }
 
 /// Runs the gates: the drift gates, the counters, the comparison with the
@@ -316,6 +331,7 @@ fn run_gates(cli: &Cli, context: &Context, run: &Run<'_>) -> Result<check::Repor
         paths: run.paths,
         ignore: &ignore,
         strict: cli.strict,
+        no_ratchet: run.no_ratchet,
     };
     let mut report = check::check_with_ignore(
         &context.config,
@@ -373,6 +389,44 @@ fn run_gates(cli: &Cli, context: &Context, run: &Run<'_>) -> Result<check::Repor
     Ok(report)
 }
 
+/// Writes the auto-baseline improvements of a coherent run in one pass.
+///
+/// Every scope and the global fallback are independent records, and all of
+/// them land in a single write: a partially tightened baseline would be a
+/// different gate than the run that reported it.  Only values move; a reason
+/// already carried by a record stays with it.
+fn persist_baseline_updates(context: &Context, report: &Report) -> Result<(), Error> {
+    if report.baseline_updates.is_empty() {
+        return Ok(());
+    }
+    let mut baseline = Baseline::load_if_exists(Some(&context.root), &context.baseline_path)?;
+    for update in &report.baseline_updates {
+        let record = baseline
+            .rules
+            .entry(update.id.clone())
+            .or_insert_with(|| BaselineRecord {
+                value: None,
+                reason: None,
+                scopes: Default::default(),
+            });
+        match &update.scope {
+            Some(scope) => {
+                let existing = record.scopes.get(scope).and_then(|old| old.reason.clone());
+                record.scopes.insert(
+                    scope.clone(),
+                    baseline::ScopeBaselineRecord {
+                        value: update.value,
+                        reason: existing,
+                    },
+                );
+            }
+            None => record.value = Some(update.value),
+        }
+    }
+    baseline.save(Some(&context.root), &context.baseline_path)?;
+    Ok(())
+}
+
 /// Renders the run into a Markdown report (SPEC 14).
 ///
 /// The report is a **rendering of a run**: the same counters and the same
@@ -407,6 +461,10 @@ fn cmd_report(cli: &Cli, args: &ReportArgs, cwd: &Path) -> Result<i32, Error> {
             fix: false,
             // The report runs no drift gate.
             drift: false,
+            // A report renders a run; it never writes a baseline.  A report
+            // can itself be a drift generator, so a write here would mutate
+            // the tree from inside a gate that promises not to.
+            no_ratchet: true,
         },
     )?;
     let markdown = report::render_markdown(&report);
@@ -1263,9 +1321,23 @@ enum Raise {
 /// job (`baseline update`), and a raise without a reason is refused — the
 /// reason is what makes the move reviewable (SPEC 4, 5.2).
 ///
+/// Only a `fixed` rule can be raised: an `auto` baseline is advanced by the
+/// check itself, so a deliberate constant limit has to be declared as such.
 /// `current` is the value the baseline has today, `None` when the rule has no
 /// baseline yet.
 fn decide_raise(rule: &Rule, current: Option<i64>, value: i64, reason: Option<&str>) -> Raise {
+    // An auto baseline is owned by the check: a raise would be tightened away
+    // by the next coherent run.  A deliberate constant limit is a `fixed`
+    // rule — that is the only way to keep a raised value.
+    if rule.baseline_mode == BaselineMode::Auto {
+        return Raise::Refuse {
+            message: format!(
+                "refusing: rule {} has baseline \"auto\" — a raise would be tightened by the next \
+                 check; set \"baseline\": \"fixed\" for a deliberate constant limit",
+                rule.id
+            ),
+        };
+    }
     let Some(reason) = reason.map(str::trim).filter(|reason| !reason.is_empty()) else {
         return Raise::Refuse {
             message:
@@ -1978,6 +2050,14 @@ struct CheckArgs {
     /// Apply the fixable: regenerate the generated files.
     #[arg(long)]
     fix: bool,
+
+    /// Run the checks without tightening or writing any baseline.
+    ///
+    /// By default a coherent, successful check advances every `auto` baseline
+    /// to the current count and writes the baseline file.  This flag leaves
+    /// the tree untouched — a dry run for CI that only validates the gates.
+    #[arg(long)]
+    no_ratchet: bool,
 }
 
 /// The arguments of `drift`.
@@ -2143,14 +2223,20 @@ mod tests {
         assert_eq!(normalized.len(), 2);
     }
 
-    /// A rule with a direction, for the decision of a raise.
+    /// A fixed rule with a direction, for the decision of a raise.
     fn rule(direction: Direction) -> Rule {
+        rule_with_mode(direction, BaselineMode::Fixed)
+    }
+
+    /// A rule with a direction and a baseline mode, for the decision of a raise.
+    fn rule_with_mode(direction: Direction, mode: BaselineMode) -> Rule {
         Rule {
             id: "a".to_string(),
             class: "c".to_string(),
             incident: "i".to_string(),
             unit: "u".to_string(),
             direction,
+            baseline_mode: mode,
             tier: Tier::Fast,
             count: config::Counter::Command {
                 command: vec!["echo".to_string(), "1".to_string()],
@@ -2251,5 +2337,33 @@ mod tests {
         let message =
             refusal(Direction::Ceiling, None, 7, Some("because")).expect("the raise is refused");
         assert!(message.contains("no baseline for a"), "{message}");
+    }
+
+    #[test]
+    fn a_raise_of_an_auto_rule_is_refused_even_with_a_reason() {
+        let decision = decide_raise(
+            &rule_with_mode(Direction::Ceiling, BaselineMode::Auto),
+            Some(5),
+            7,
+            Some("because"),
+        );
+        assert!(
+            matches!(decision, Raise::Refuse { .. }),
+            "an auto rule must never be raised"
+        );
+        let Raise::Refuse { message } = decision else {
+            return;
+        };
+        assert!(message.contains("\"baseline\": \"fixed\""), "{message}");
+        assert!(message.contains("auto"), "{message}");
+    }
+
+    #[test]
+    fn a_raise_of_a_fixed_rule_with_a_reason_still_moves() {
+        // The fixed rule is the one a deliberate constant limit declares.
+        let (value, reason, _) = movement(Direction::Ceiling, Some(5), 7, Some("because"))
+            .expect("the fixed rule is raised");
+        assert_eq!(value, 7);
+        assert_eq!(reason, "because");
     }
 }
