@@ -29,7 +29,9 @@ fn scoped_file_metrics_initialize_check_report_and_raise_only_one_scope() {
         "scopes": [{"id":"auth", "description":"Authentication module", "files":["src/auth/**"]}]
       }}
     }"#;
-    let repo = Repo::plain(config, None);
+    // A deliberate raise of one scope needs a fixed baseline: an auto scope
+    // would be tightened by the next check.
+    let repo = Repo::plain(&fixed(config), None);
     repo.write("src/auth/Login.java", "abc");
     repo.write("src/util/Other.java", "123456");
     let missing = repo.run(&["check", "--format", "json"]);
@@ -379,6 +381,16 @@ fn ceiling_config() -> &'static str {
     ]"#
 }
 
+/// The same rules, but with constant baselines.
+///
+/// `baseline raise` is a deliberate move against the declared direction, so it
+/// only applies to a rule that declares `"baseline": "fixed"`; an `auto`
+/// baseline would be tightened by the next check.  The helper inserts the
+/// field mechanically into every rule of a fixture.
+fn fixed(config: &str) -> String {
+    config.replace("\"count\": {", "\"baseline\": \"fixed\", \"count\": {")
+}
+
 /// A config with one floor rule that counts three.
 fn floor_config() -> &'static str {
     r#"[
@@ -595,7 +607,8 @@ fn the_json_format_prints_only_json() {
     assert_eq!(report["rules"][0]["id"], "todo-markers");
     assert_eq!(report["rules"][0]["status"], "ok");
     assert_eq!(report["rules"][0]["count"], 3);
-    assert_eq!(report["rules"][0]["baseline"], 5);
+    // An auto ceiling is tightened to the count in memory on a green run.
+    assert_eq!(report["rules"][0]["baseline"], 3);
     assert_eq!(report["rules"][0]["direction"], "ceiling");
     assert_eq!(report["rules"][0]["unit"], "markers");
     assert_eq!(report["rules"][0]["class"], "unfinished work");
@@ -1521,9 +1534,15 @@ fn the_arguments_of_a_counter_arrive_verbatim() {
 fn the_engine_does_not_mutate_the_tree() {
     let repo = Repo::new(ceiling_config(), Some(&baseline("todo-markers", 5)));
 
-    let output = repo.run(&["check"]);
+    // A normal check tightens an auto baseline and writes it; the dry run is
+    // the contract that a validation must leave the tree untouched.
+    let output = repo.run(&["check", "--no-ratchet"]);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
-    assert_eq!(repo.status(), "", "check changed the working tree");
+    assert_eq!(
+        repo.status(),
+        "",
+        "check --no-ratchet changed the working tree"
+    );
 
     let output = repo.run(&["count"]);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
@@ -5349,7 +5368,10 @@ fn baseline_of(repo: &Repo) -> Value {
 
 #[test]
 fn baseline_raise_writes_the_value_and_the_reason() {
-    let repo = Repo::new(two_directions_config(), Some(&two_records_baseline()));
+    let repo = Repo::new(
+        &fixed(two_directions_config()),
+        Some(&two_records_baseline()),
+    );
 
     let output = repo.run(&[
         "baseline",
@@ -5378,7 +5400,10 @@ fn baseline_raise_writes_the_value_and_the_reason() {
 
 #[test]
 fn baseline_raise_without_a_reason_is_refused() {
-    let repo = Repo::new(two_directions_config(), Some(&two_records_baseline()));
+    let repo = Repo::new(
+        &fixed(two_directions_config()),
+        Some(&two_records_baseline()),
+    );
     let before = repo.read("ratchet.baseline.json");
 
     let output = repo.run(&[
@@ -5400,7 +5425,10 @@ fn baseline_raise_without_a_reason_is_refused() {
 
 #[test]
 fn baseline_raise_refuses_the_paydown_direction() {
-    let repo = Repo::new(two_directions_config(), Some(&two_records_baseline()));
+    let repo = Repo::new(
+        &fixed(two_directions_config()),
+        Some(&two_records_baseline()),
+    );
     let before = repo.read("ratchet.baseline.json");
 
     // A ceiling that goes down is the paydown's job.
@@ -5441,7 +5469,10 @@ fn baseline_raise_refuses_the_paydown_direction() {
 fn baseline_raise_lowers_a_floor_deliberately() {
     // A floor may only increase: the move against that direction is a
     // deliberate lowering.
-    let repo = Repo::new(two_directions_config(), Some(&two_records_baseline()));
+    let repo = Repo::new(
+        &fixed(two_directions_config()),
+        Some(&two_records_baseline()),
+    );
 
     let output = repo.run(&[
         "baseline",
@@ -5489,7 +5520,7 @@ fn baseline_raise_of_an_unknown_rule_exits_two() {
 
 #[test]
 fn baseline_raise_of_a_rule_without_a_baseline_is_refused() {
-    let repo = Repo::new(ceiling_config(), None);
+    let repo = Repo::new(&fixed(ceiling_config()), None);
 
     let output = repo.run(&[
         "baseline",
@@ -5513,7 +5544,7 @@ fn baseline_raise_of_a_rule_without_a_baseline_is_refused() {
 
 #[test]
 fn the_json_report_names_the_raise_command() {
-    let repo = Repo::new(ceiling_config(), Some(&baseline("todo-markers", 5)));
+    let repo = Repo::new(&fixed(ceiling_config()), Some(&baseline("todo-markers", 5)));
 
     let output = repo.run(&[
         "baseline",
@@ -5538,7 +5569,9 @@ fn the_json_report_names_the_raise_command() {
 
 #[test]
 fn the_monotonicity_check_accepts_a_raise_with_a_reason() {
-    let repo = Repo::new(ceiling_config(), Some(&baseline("todo-markers", 5)));
+    // A deliberate raise stays put on a fixed rule: an auto one would tighten
+    // back to the count and the reason would be lost from the report.
+    let repo = Repo::new(&fixed(ceiling_config()), Some(&baseline("todo-markers", 5)));
     // The working tree raises the baseline and says why.
     repo.write(
         "ratchet.baseline.json",
@@ -5661,7 +5694,7 @@ fn the_paydown_still_refuses_the_forbidden_direction() {
 
 #[test]
 fn baseline_raise_of_a_negative_value_is_refused() {
-    let repo = Repo::new(ceiling_config(), Some(&baseline("todo-markers", 5)));
+    let repo = Repo::new(&fixed(ceiling_config()), Some(&baseline("todo-markers", 5)));
     let before = repo.read("ratchet.baseline.json");
 
     let output = repo.run(&[
@@ -5687,7 +5720,7 @@ fn baseline_raise_of_a_negative_value_is_refused() {
 
 #[test]
 fn baseline_raise_with_an_empty_reason_is_refused() {
-    let repo = Repo::new(ceiling_config(), Some(&baseline("todo-markers", 5)));
+    let repo = Repo::new(&fixed(ceiling_config()), Some(&baseline("todo-markers", 5)));
     let before = repo.read("ratchet.baseline.json");
 
     let output = repo.run(&[

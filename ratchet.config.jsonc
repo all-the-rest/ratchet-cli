@@ -3,8 +3,10 @@
 //
 // The engine owns the baseline, the direction, the monotonicity and the
 // report (SPEC 3); `scripts/count.sh` owns the counting.  A rule whose
-// count is zero today is a boolean gate — no occurrence may appear — and
-// only `dependency-count` is a ratchet: its baseline may only decrease.
+// count is zero today is a boolean gate — no occurrence may appear.
+// Every rule here is a fixed limit: a constant baseline, not a ratchet.
+// A project that wants a gate to tighten on its own leaves `baseline` at
+// its default `"auto"`; this repository's limits are architectural.
 [
   { "preset": "agent-rules" },
   {
@@ -20,11 +22,70 @@
       "version": { "path": "Cargo.toml", "format": "toml", "section": "package", "key": "version" }
     },
     "rules": {
+      // The preset's limits are architectural constants. A full definition
+      // overrides the preset rule; a partial one would fail as a rule without
+      // a class, incident, unit, direction and count.
+      "rule-file-max-lines": {
+        "class": "a rule file drifting into a specification",
+        "incident": "LuminaRust/Agents.md reached 623 lines and open-accreditation 380: architecture, stack and release runbook in the file every session loads",
+        "unit": "lines in the longest rule file",
+        "direction": "ceiling",
+        "baseline": "fixed",
+        "aggregate": "max",
+        "description": "the largest `AGENTS.md` in the tree, measured in lines; the paydown is a module-local `AGENTS.md` next to the code it describes",
+        "count": { "file_metrics": { "files": ["**/AGENTS.md"], "metric": "line_count" } }
+      },
+      "rule-file-name": {
+        "class": "a rule file the harness cannot see",
+        "incident": "LuminaRust, jku-itpj2627-webshop-base and all-the-rest-skills carried `Agents.md`; tools that look up `AGENTS.md` by exact name never loaded it",
+        "unit": "rule files with the wrong file name",
+        "direction": "ceiling",
+        "baseline": "fixed",
+        "description": "counts every tracked `AGENTS.md` whose spelling differs — the comparison is case-sensitive by design",
+        "count": { "agent_rule": "rule-file-name" }
+      },
+      "rule-file-present": {
+        "class": "a project without rules",
+        "incident": "noema had three workflows and a clean verification history but no project rules at all — the practice lived only in the global config",
+        "unit": "root rule files",
+        "direction": "floor",
+        "baseline": "fixed",
+        "description": "1 when `AGENTS.md` exists at the repository root, 0 when it does not",
+        "count": { "agent_rule": "rule-file-present" }
+      },
+      "plan-status-line": {
+        "class": "a plan without a state",
+        "incident": "LuminaRust had six plan documents and no status line in two of them — 'done', 'planned' and 'recommendation' were indistinguishable",
+        "unit": "plans without a status line",
+        "direction": "ceiling",
+        "baseline": "fixed",
+        "description": "counts `docs/plans/*.md` that do not carry `**Status:**` within their first 15 lines; without a `docs/plans/` directory the count is 0",
+        "count": { "agent_rule": "plan-status-line" }
+      },
+      "gates-untouched": {
+        "class": "a gate disarmed by the change it should catch",
+        "incident": "the gates run from the working tree, so one commit can weaken the check scripts and the code they guard together",
+        "unit": "commits that change a gate and product code at once",
+        "direction": "ceiling",
+        "baseline": "fixed",
+        "description": "counts the commits not yet on `origin/main` that touch a gate path and product code in the same commit; documentation and rule files do not count as product code",
+        "count": { "agent_rule": "gates-untouched" }
+      },
+      "unverified-commits": {
+        "class": "a commit with no verification evidence",
+        "incident": "eight repositories carry a `Verify:` footer in 20 of 20 commits while ai-10-usd carries it in 3 of 20 — the convention exists, the enforcement does not",
+        "unit": "commits without a `Verify:` footer",
+        "direction": "ceiling",
+        "baseline": "fixed",
+        "description": "counts the commits of the history whose message has no `Verify:` line; a project with tagged releases narrows the window with `since`",
+        "count": { "agent_rule": "unverified-commits" }
+      },
       "dependency-count": {
         "class": "supply-chain debt",
         "incident": "the number of declared dependencies was written down nowhere, so the supply-chain debt could only grow silently — this baseline records the count of today",
         "unit": "dependency entries",
         "direction": "ceiling",
+        "baseline": "fixed",
         "description": "the counted scope is the dependency sections of this package — `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]` and their target-specific forms — in the inline and in the table form; `[workspace.dependencies]` is not a dependency of this package. An entry is a key at the start of a line: a multi-line inline table whose continuation starts at column 0 is counted twice",
         "count": { "command": ["sh", "scripts/count.sh", "dependency-count"] }
       },
@@ -33,6 +94,7 @@
         "incident": "prevention: no instance in this project yet — a home path in the source would make the build machine-specific",
         "unit": "occurrences",
         "direction": "ceiling",
+        "baseline": "fixed",
         "description": "the counted scope is every `*.rs` file under `src/` — the crate's own sources, the inline `#[cfg(test)]` modules included; the integration tests under `tests/` are a separate crate and are not counted. The count is a textual match — a path in a comment or in a string counts too, so the count can only be too high, never too low",
         "count": { "command": ["sh", "scripts/count.sh", "no-machine-path-in-source"] }
       },
@@ -41,6 +103,7 @@
         "incident": "prevention: no instance in this project yet — a panic is not a clean failure: the tool must report the problem, never crash",
         "unit": "occurrences",
         "direction": "ceiling",
+        "baseline": "fixed",
         "description": "the counted scope is every `*.rs` file under `src/` — the crate's own sources, the inline `#[cfg(test)]` modules included; the integration tests under `tests/` are a separate crate and are not counted. The count is a textual match — the word in a comment or in a string counts too, so the count can only be too high, never too low",
         "count": { "command": ["sh", "scripts/count.sh", "no-panic-in-source"] }
       },
@@ -49,6 +112,7 @@
         "incident": "prevention: no instance in this project yet — `todo!` and `unimplemented!` are unfinished paths, not decisions; the word in a comment or in a string is not a marker either, but the count is textual and counts it anyway",
         "unit": "occurrences",
         "direction": "ceiling",
+        "baseline": "fixed",
         "description": "the counted scope is every `*.rs` file under `src/` — the crate's own sources, the inline `#[cfg(test)]` modules included; the integration tests under `tests/` are a separate crate and are not counted. The count is a textual match — the word in a comment or in a string counts too, so the count can only be too high, never too low",
         "count": { "command": ["sh", "scripts/count.sh", "no-unfinished-marker"] }
       },
@@ -57,6 +121,7 @@
         "incident": "prevention: no instance in this project yet — the engine must stay free of `unsafe`, so that a review can rely on safe Rust",
         "unit": "occurrences",
         "direction": "ceiling",
+        "baseline": "fixed",
         "description": "the counted scope is every `*.rs` file under `src/` — the crate's own sources, the inline `#[cfg(test)]` modules included; the integration tests under `tests/` are a separate crate and are not counted. The count is a textual match — the word in a comment or in a string counts too, so the count can only be too high, never too low",
         "count": { "command": ["sh", "scripts/count.sh", "no-unsafe-in-source"] }
       }

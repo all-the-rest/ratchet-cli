@@ -6,7 +6,11 @@ and the code is the bug.
 
 `ratchet` implements the mechanics of the `ratchet-gates` skill: gates that
 compare a **count** against a **baseline** that may only move in one declared
-direction, and **drift gates** for generated files.
+direction, and **drift gates** for generated files. By default a rule is an
+**auto ratchet**: a green `check` moves its baseline in the good direction and
+writes it, so a gate gets tighter without a manual step. A rule that must hold
+a **constant limit** declares `"baseline": "fixed"` — then the baseline only
+moves by an explicit command.
 
 ---
 
@@ -21,6 +25,7 @@ direction, and **drift gates** for generated files.
 | direction | `ceiling` (count must not exceed the baseline) or `floor` (count must not fall below it) |
 | count | the current measurement |
 | baseline | the committed number the count is compared against |
+| baseline mode | `auto` (default: `check` tightens the baseline on a green run) or `fixed` (a constant limit; only `baseline update`/`baseline raise` move it) |
 | tier | `fast` (seconds, no infrastructure) or `slow` (real infrastructure) |
 | drift | a generated file differs from what its generator produces |
 
@@ -163,6 +168,7 @@ shorthand for a one-element array.
 | `incident` | string | yes | the incident that motivated the rule (see below) |
 | `unit` | string | yes | the count unit |
 | `direction` | `ceiling` \| `floor` | yes | the allowed direction of the baseline |
+| `baseline` | `auto` \| `fixed` | no (default `auto`) | `auto` tightens the baseline on a green `check`; `fixed` keeps a constant limit |
 | `tier` | `fast` \| `slow` | no (default `fast`) | which tier the rule belongs to |
 | `count` | object | yes | how the count is produced (see 3.4) |
 | `exclude` | string[] | no | glob patterns removed from the counted **items** (path-shaped exemptions only) |
@@ -403,8 +409,8 @@ failure, not a pass — the rule that would have run is not silently skipped.
 }
 ```
 
-* Machine-written by `ratchet baseline init`, `ratchet baseline update` and
-  `ratchet baseline raise`.
+* Machine-written by `ratchet check` (auto rules, green run), `ratchet baseline
+  init`, `ratchet baseline update` and `ratchet baseline raise`.
 * Never hand-edited.
 * `reason` is optional and only present when one was given. It does more than
   explain a paydown: it is what makes a **deliberate move against the declared
@@ -595,7 +601,13 @@ Moves the baseline to the current count, **only in the allowed direction**:
 Rules that may not move are reported as refused and are **not** modified; the
 command then exits `1` so the refusal is noticed. `--rule` restricts it to one
 rule. `--reason <text>` is stored in the baseline record. Touches only the
-baseline file. Never runs automatically.
+baseline file.
+
+`check` takes the same allowed-direction step automatically for every rule
+whose baseline mode is `auto`, and only on a coherent green run; a failed run
+and `check --no-ratchet` leave the baseline untouched. A `fixed` rule never
+moves on its own: `baseline update` is the manual way to move it in the allowed
+direction, and `baseline raise` the deliberate way against it.
 
 `baseline update` is also the **cleanup step**, and it is always tolerant:
 `--strict` has no effect here. It prunes every stale artifact (§5.2) from the
@@ -978,7 +990,10 @@ report's content. `ratchet check` is the gate.
 * No Node API and no npm plugin registry.
 * No rule *functions* in the config — the engine is a runtime-free binary.
 * No automatic fix of violations; `--fix` only regenerates generated files.
-* No automatic baseline change; `baseline update` is always explicit.
+* No automatic baseline change **against** the declared direction: a weaker
+  baseline still needs `baseline raise` with a reason, and a `fixed` rule never
+  moves on its own. Tightening an `auto` baseline in the allowed direction on a
+  green check is a goal, not a non-goal.
 
 ## 12. The GitHub Action
 

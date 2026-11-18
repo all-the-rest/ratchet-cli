@@ -17,7 +17,7 @@ English — code, comments, docs, commit messages.
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo build && ./target/debug/ratchet check
+cargo build && ./target/debug/ratchet check --no-ratchet
 ```
 
 All four must pass before a commit. `cargo fmt` (without `--check`) fixes
@@ -26,9 +26,9 @@ formatting; never hand-format.
 The last command is the repository's own gate: `cargo build` produces the
 binary in `target/debug/`, and `ratchet check` runs it from the repository
 root. The rules live in `ratchet.config.jsonc`, the counters in
-`scripts/count.sh`, the baselines in `ratchet.baseline.json`. A gate that
-fails is a failed gate, not a gate to be moved: the baseline of a ceiling may
-only decrease, and `ratchet baseline update` is the only way to move it.
+`scripts/count.sh`, the baselines in `ratchet.baseline.json`. Ceilings only
+decrease, floors only increase: `check` tightens `auto` baselines on a green
+run; `fixed` ones move only via `baseline update` / `baseline raise` (+reason).
 
 ## Dependencies
 

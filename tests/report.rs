@@ -166,6 +166,9 @@ fn config(generated: &str) -> String {
             "incident": "a TODO marker was merged without a tracking issue",
             "unit": "markers",
             "direction": "ceiling",
+            // Constant baselines keep the documented report numbers: a
+            // `report` run would otherwise tighten auto ceilings to 2 and 3.
+            "baseline": "fixed",
             "tier": "fast",
             "count": {{ "command": ["echo", "3"] }}
           }},
@@ -174,6 +177,7 @@ fn config(generated: &str) -> String {
             "incident": "a finding was closed without a regression test",
             "unit": "findings",
             "direction": "ceiling",
+            "baseline": "fixed",
             "tier": "fast",
             "count": {{ "registry": "ratchet.findings.json", "severities": ["critical", "high"],
                        "statuses": ["open", "in-progress"] }}
@@ -831,6 +835,9 @@ fn report_repo(generated: &str) -> Repo {
             "incident": "a TODO marker was merged without a tracking issue",
             "unit": "markers",
             "direction": "ceiling",
+            // A fixed baseline keeps the check from writing during the
+            // drift-gate test: that test asserts the tree is untouched.
+            "baseline": "fixed",
             "count": { "command": ["echo", "3"] }
           }
         },
