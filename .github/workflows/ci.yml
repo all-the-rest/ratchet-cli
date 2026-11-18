@@ -64,7 +64,7 @@ jobs:
         # the gate runs.
         run: |
           cargo build
-          ./target/debug/ratchet check
+          ./target/debug/ratchet check --no-ratchet
 
       - name: "Self-gate: ratchet check (Windows)"
         if: runner.os == 'Windows'
@@ -73,4 +73,4 @@ jobs:
         # produces an .exe there.
         run: |
           cargo build
-          .\target\debug\ratchet.exe check
+          .\target\debug\ratchet.exe check --no-ratchet
