@@ -191,6 +191,32 @@ impl Direction {
     }
 }
 
+/// How the baseline of a rule moves.
+///
+/// The default is `auto`: `ratchet check` tightens the baseline towards the
+/// current count on every coherent, successful run, so a gate can only get
+/// stricter without a separate command.  A rule that must stay a constant
+/// limit declares `fixed`; only the explicit baseline commands move it, and
+/// `baseline raise` is available for a deliberate move against the direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BaselineMode {
+    /// Each successful check advances the baseline in the improving direction.
+    Auto,
+    /// The baseline is a constant limit; only baseline commands move it.
+    Fixed,
+}
+
+impl BaselineMode {
+    /// The name used in configs and reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BaselineMode::Auto => "auto",
+            BaselineMode::Fixed => "fixed",
+        }
+    }
+}
+
 /// The tier a rule belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -460,6 +486,12 @@ pub struct Rule {
     pub unit: String,
     /// The allowed direction of the baseline.
     pub direction: Direction,
+    /// How the baseline moves: `auto` (the default) or `fixed`.
+    ///
+    /// Serialized under the config name `baseline` so the resolved config a
+    /// `--debug` run prints can be read back as a config.
+    #[serde(rename = "baseline")]
+    pub baseline_mode: BaselineMode,
     /// The tier of the rule.
     pub tier: Tier,
     /// How the count is produced.
@@ -1165,6 +1197,7 @@ fn parse_rule(id: &str, value: &Value) -> Result<Rule, ConfigError> {
             "incident",
             "unit",
             "direction",
+            "baseline",
             "tier",
             "count",
             "exclude",
@@ -1197,6 +1230,21 @@ fn parse_rule(id: &str, value: &Value) -> Result<Rule, ConfigError> {
                 format!("expected \"ceiling\" or \"floor\", found \"{other}\""),
             ));
         }
+    };
+    // A rule ratchets by default: a gate gets tighter on every coherent check
+    // unless the project declares it a constant limit.
+    let baseline_mode = match map.get("baseline") {
+        None => BaselineMode::Auto,
+        Some(value) => match expect_string(value, &format!("{path}.baseline"))?.as_str() {
+            "auto" => BaselineMode::Auto,
+            "fixed" => BaselineMode::Fixed,
+            other => {
+                return Err(ConfigError::new(
+                    format!("{path}.baseline"),
+                    format!("expected \"auto\" or \"fixed\", found \"{other}\""),
+                ));
+            }
+        },
     };
     let tier = match map.get("tier") {
         None => Tier::Fast,
@@ -1286,6 +1334,7 @@ fn parse_rule(id: &str, value: &Value) -> Result<Rule, ConfigError> {
         incident,
         unit,
         direction,
+        baseline_mode,
         tier,
         count,
         exclude,
@@ -1922,6 +1971,41 @@ mod tests {
 
     fn scoped_metric_config(scopes: &str) -> String {
         r#"{"rules":{"size":{"class":"growth","incident":"i","unit":"bytes","direction":"ceiling","aggregate":"max","count":{"file_metrics":{"files":["**/*.java"],"metric":"size_bytes"}},"scopes":SCOPES}}}"#.replace("SCOPES", scopes)
+    }
+
+    /// The simplest rule: no baseline field, so the default mode applies.
+    fn simple_rule_config(extra: &str) -> String {
+        format!(
+            r#"{{"rules":{{"r":{{"class":"c","incident":"i","unit":"u","direction":"ceiling",{extra}"count":{{"command":["echo","1"]}}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn the_baseline_mode_defaults_to_auto() {
+        let config = parse_config_str(&simple_rule_config("")).expect("a valid config");
+        let rule = config.rules.get("r").expect("the rule");
+        assert_eq!(rule.baseline_mode, BaselineMode::Auto);
+        assert_eq!(rule.baseline_mode.as_str(), "auto");
+        // The mode is serialized under the config's field name.
+        let json = serde_json::to_string(&config).expect("the resolved config serializes");
+        assert!(json.contains("\"baseline\":\"auto\""), "{json}");
+    }
+
+    #[test]
+    fn an_explicit_fixed_baseline_mode_parses() {
+        let config = parse_config_str(&simple_rule_config("\"baseline\":\"fixed\","))
+            .expect("a valid fixed rule");
+        let rule = config.rules.get("r").expect("the rule");
+        assert_eq!(rule.baseline_mode, BaselineMode::Fixed);
+        assert_eq!(rule.baseline_mode.as_str(), "fixed");
+    }
+
+    #[test]
+    fn an_unknown_baseline_mode_is_rejected_with_its_path() {
+        let error = parse_config_str(&simple_rule_config("\"baseline\":\"drifting\","))
+            .expect_err("an unknown mode is rejected");
+        assert_eq!(error.path, "rules.r.baseline");
+        assert!(error.message.contains("\"auto\" or \"fixed\""), "{error}");
     }
 
     #[test]

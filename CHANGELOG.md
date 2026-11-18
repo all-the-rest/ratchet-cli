@@ -123,3 +123,19 @@ block is written by `ratchet release`.
 ### Added
 
 - contain filesystem operations in a capability root (#29) (engine)
+
+## [1.0.0] - 2026-11-18
+
+### Added
+
+- auto-tightening baselines: `check` moves an `auto` rule's ceiling down / floor
+  up on a green run and writes the new value; `check --no-ratchet` runs without
+  writing (#34) (baseline)
+- per-rule `"baseline": "auto" | "fixed"` — `fixed` keeps a constant limit;
+  `auto` is the new default and refuses `baseline raise` (#34) (config)
+
+### Changed
+
+- **BREAKING**: baselines now tighten by default. Rules that must stay at a
+  constant limit — maximum line length, architecture rules — need an explicit
+  `"baseline": "fixed"`; `baseline raise` applies only to fixed rules (#34)
