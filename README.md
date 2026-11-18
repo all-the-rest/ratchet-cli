@@ -16,10 +16,6 @@ By default a rule is an **auto ratchet**: on a green `check` its baseline moves
 in the allowed direction and is written, so every added test protects itself.
 A constant limit (max line length, an architecture rule) declares
 `"baseline": "fixed"` and never moves on its own.
-By default a rule is an **auto ratchet**: a green `check` tightens its baseline
-and writes it, so every added test protects itself. A rule that must hold a
-**constant limit** (max line length, an architecture rule) declares
-`"baseline": "fixed"` and never moves on its own.
 
 ## Install
 
