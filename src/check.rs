@@ -3,7 +3,7 @@
 use globset::GlobMatcher;
 
 use crate::baseline::Baseline;
-use crate::config::{Config, Direction, Rule, Tier};
+use crate::config::{BaselineMode, Config, Direction, Rule, Tier};
 use crate::counter;
 use crate::drift::DriftEntry;
 use crate::git::Git;
@@ -64,6 +64,11 @@ pub struct RuleResult {
     pub count: Option<i64>,
     /// The baseline the count was compared against.
     pub baseline: Option<i64>,
+    /// The baseline as recorded in the file, before an auto improvement.
+    ///
+    /// A red run does not write its improvements, so it must not display them
+    /// either: the recorded value is restored before rendering.
+    pub recorded_baseline: Option<i64>,
     /// The direction of the rule.
     pub direction: Option<Direction>,
     /// The count unit.
@@ -101,6 +106,7 @@ impl RuleResult {
             status: RuleStatus::CounterError,
             count: None,
             baseline: None,
+            recorded_baseline: None,
             direction: Some(rule.direction),
             unit: Some(rule.unit.clone()),
             class: Some(rule.class.clone()),
@@ -142,8 +148,25 @@ pub struct Report {
     pub notes: Vec<String>,
     /// The debug log (`--debug`).
     pub debug: Vec<String>,
+    /// The auto-baseline improvements the run found in memory.
+    ///
+    /// They are applied to the baseline file only by `check`, and only when
+    /// the run is coherent and successful.  `report` never writes a baseline.
+    /// An empty list means there was nothing to tighten, and nothing to write.
+    pub baseline_updates: Vec<BaselineUpdate>,
     /// True when the run is green: no gate failed and no counter failed.
     pub ok: bool,
+}
+
+/// One in-memory improvement of an auto baseline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineUpdate {
+    /// The rule whose baseline improved.
+    pub id: String,
+    /// The named scope, or `None` for the global fallback.
+    pub scope: Option<String>,
+    /// The improved value — the count that was measured.
+    pub value: i64,
 }
 
 impl Default for Report {
@@ -157,12 +180,34 @@ impl Default for Report {
             stale_errors: 0,
             notes: Vec::new(),
             debug: Vec::new(),
+            baseline_updates: Vec::new(),
             ok: true,
         }
     }
 }
 
 impl Report {
+    /// Settles the in-memory improvements with the decision to write them.
+    ///
+    /// A caller that writes them keeps the displayed values. A caller that
+    /// does not — a red run, a dry run, a report — restores the recorded
+    /// values, so a PASS line never shows a baseline the file does not hold.
+    pub fn settle_baseline(&mut self, persist: bool) {
+        if persist {
+            return;
+        }
+        for update in &self.baseline_updates {
+            if let Some(result) = self
+                .rules
+                .iter_mut()
+                .find(|result| result.id == update.id && result.scope_id == update.scope)
+            {
+                result.baseline = result.recorded_baseline;
+            }
+        }
+        self.baseline_updates.clear();
+    }
+
     /// The number of failed rules.
     pub fn failed(&self) -> usize {
         self.rules
@@ -213,6 +258,12 @@ pub struct Selection<'a> {
     /// The default is tolerant: a record the config no longer configures and
     /// a configured scope that selects no files are notes (SPEC 5.2).
     pub strict: bool,
+    /// Do not tighten auto baselines — `check --no-ratchet`.
+    ///
+    /// The default is `false`: a successful check advances every auto baseline
+    /// in the improving direction.  A dry run for CI sets it so the check
+    /// compares against the committed numbers and leaves the tree untouched.
+    pub no_ratchet: bool,
 }
 
 impl Selection<'_> {
@@ -440,13 +491,30 @@ pub fn check_with_ignore(
                         }
                     }
                 }
+                // An auto baseline advances to the count in memory when the
+                // count is strictly better.  The gate was compared against the
+                // recorded value above; only the displayed value moves, and a
+                // caller persists it after a coherent, successful run.
+                let improved = if selection.no_ratchet || status != RuleStatus::Ok {
+                    None
+                } else {
+                    tightened(rule, count, record_value)
+                };
+                if let Some(value) = improved {
+                    report.baseline_updates.push(BaselineUpdate {
+                        id: id.clone(),
+                        scope: scope_id.clone(),
+                        value,
+                    });
+                }
                 report.rules.push(RuleResult {
                     id: id.clone(),
                     scope_id,
                     scope_description: Some(description),
                     status,
                     count: Some(count),
-                    baseline: record_value,
+                    baseline: improved.or(record_value),
+                    recorded_baseline: record_value,
                     direction: Some(rule.direction),
                     unit: Some(rule.unit.clone()),
                     class: Some(rule.class.clone()),
@@ -564,13 +632,29 @@ pub fn check_with_ignore(
             }
         }
 
+        // The flat path tightens exactly like the scoped one: the comparison
+        // above used the recorded value, the displayed value is the improved
+        // one, and the caller persists it only after a coherent run.
+        let improved = if selection.no_ratchet || status != RuleStatus::Ok {
+            None
+        } else {
+            tightened(rule, count, record_value)
+        };
+        if let Some(value) = improved {
+            report.baseline_updates.push(BaselineUpdate {
+                id: id.clone(),
+                scope: None,
+                value,
+            });
+        }
         report.rules.push(RuleResult {
             id: id.clone(),
             scope_id: None,
             scope_description: None,
             status,
             count: Some(count),
-            baseline: record_value,
+            baseline: improved.or(record_value),
+            recorded_baseline: record_value,
             direction: Some(rule.direction),
             unit: Some(rule.unit.clone()),
             class: Some(rule.class.clone()),
@@ -848,6 +932,102 @@ mod scoped_tests {
     }
 }
 
+#[cfg(test)]
+mod ratchet_tests {
+    use super::*;
+    use crate::test_tempdir::TempDir;
+    use std::fs;
+
+    /// A rule that counts lines in `src/*.txt`, with the mode under test.
+    fn config(mode: &str, direction: &str) -> Config {
+        let text = format!(
+            r#"{{"rules":{{"r":{{"class":"c","incident":"i","unit":"lines","direction":"{direction}",{mode}"aggregate":"max","count":{{"file_metrics":{{"files":["src/*.txt"],"metric":"line_count"}}}}}}}}}}"#
+        );
+        crate::config::parse_config_str(&text).expect("a valid config")
+    }
+
+    fn baseline(value: i64) -> Baseline {
+        Baseline::parse(
+            &format!(r#"{{"version":1,"rules":{{"r":{{"value":{value}}}}}}}"#),
+            "b.json",
+        )
+        .expect("a valid baseline")
+    }
+
+    /// Runs one check over a file with `count` lines and a recorded baseline.
+    fn run(mode: &str, direction: &str, count: i64, value: i64, no_ratchet: bool) -> Report {
+        let root = TempDir::new().expect("a temporary directory");
+        let source = root.path().join("src");
+        fs::create_dir_all(&source).expect("the source directory is created");
+        fs::write(source.join("a.txt"), "x\n".repeat(count as usize)).expect("the file is written");
+        let selection = Selection {
+            no_ratchet,
+            ..Selection::default()
+        };
+        check(
+            &config(mode, direction),
+            &baseline(value),
+            None,
+            root.path(),
+            &selection,
+        )
+    }
+
+    fn update(value: i64) -> BaselineUpdate {
+        BaselineUpdate {
+            id: "r".to_string(),
+            scope: None,
+            value,
+        }
+    }
+
+    #[test]
+    fn an_auto_ceiling_lowers_on_check() {
+        let report = run("", "ceiling", 3, 5, false);
+        assert_eq!(report.rules[0].status, RuleStatus::Ok);
+        // The PASS line shows the tightened value, not the recorded one.
+        assert_eq!(report.rules[0].baseline, Some(3));
+        assert_eq!(report.baseline_updates, vec![update(3)]);
+    }
+
+    #[test]
+    fn an_auto_floor_raises_on_check() {
+        let report = run("", "floor", 7, 3, false);
+        assert_eq!(report.rules[0].status, RuleStatus::Ok);
+        assert_eq!(report.rules[0].baseline, Some(7));
+        assert_eq!(report.baseline_updates, vec![update(7)]);
+    }
+
+    #[test]
+    fn a_fixed_rule_does_not_move() {
+        let report = run("\"baseline\":\"fixed\",", "ceiling", 3, 5, false);
+        assert_eq!(report.rules[0].baseline, Some(5));
+        assert!(report.baseline_updates.is_empty());
+    }
+
+    #[test]
+    fn no_ratchet_compares_without_tightening_or_updates() {
+        let report = run("", "ceiling", 3, 5, true);
+        assert_eq!(report.rules[0].baseline, Some(5));
+        assert!(report.baseline_updates.is_empty());
+    }
+
+    #[test]
+    fn an_equal_count_is_not_an_improvement() {
+        let report = run("", "ceiling", 5, 5, false);
+        assert_eq!(report.rules[0].baseline, Some(5));
+        assert!(report.baseline_updates.is_empty());
+    }
+
+    #[test]
+    fn a_failing_count_does_not_tighten() {
+        let report = run("", "ceiling", 7, 5, false);
+        assert_eq!(report.rules[0].status, RuleStatus::OverBaseline);
+        assert_eq!(report.rules[0].baseline, Some(5));
+        assert!(report.baseline_updates.is_empty());
+    }
+}
+
 /// The selected paths, relative to the repository root.
 pub fn selected_paths(
     paths: &[String],
@@ -945,6 +1125,7 @@ pub fn counts_with_ignore(
                     status: RuleStatus::Ok,
                     count: Some(count),
                     baseline: None,
+                    recorded_baseline: None,
                     direction: Some(rule.direction),
                     unit: Some(rule.unit.clone()),
                     class: Some(rule.class.clone()),
@@ -977,6 +1158,7 @@ pub fn counts_with_ignore(
             status: RuleStatus::Ok,
             count: Some(count),
             baseline: None,
+            recorded_baseline: None,
             direction: Some(rule.direction),
             unit: Some(rule.unit.clone()),
             class: Some(rule.class.clone()),
@@ -1166,6 +1348,25 @@ fn glob_specificity(patterns: &[String], path: &str) -> (usize, usize) {
         })
         .max()
         .unwrap_or_default()
+}
+
+/// The value an auto baseline advances to, if any.
+///
+/// A ceiling sinks to a lower count, a floor rises to a higher one: both make
+/// the gate stricter.  `fixed` rules never move here, and a rule without a
+/// baseline has nothing to tighten — `baseline init` owns that first write.
+/// Equality is not an improvement: nothing is written when the count already
+/// matches the baseline.
+fn tightened(rule: &Rule, count: i64, baseline: Option<i64>) -> Option<i64> {
+    if rule.baseline_mode != BaselineMode::Auto {
+        return None;
+    }
+    let current = baseline?;
+    let improves = match rule.direction {
+        Direction::Ceiling => count < current,
+        Direction::Floor => count > current,
+    };
+    improves.then_some(count)
 }
 
 fn count_status(direction: Direction, count: i64, baseline: Option<i64>) -> RuleStatus {

@@ -12,6 +12,10 @@ produces. Use ratchet for the gate "no new occurrences, and the existing ones
 get paid down" across many rules, without a bespoke script per rule: the
 project owns the *counting* (one command that prints a number), ratchet owns
 the *mechanic* — baselines, direction, monotonicity, reporting, exit codes.
+By default a rule is an **auto ratchet**: on a green `check` its baseline moves
+in the allowed direction and is written, so every added test protects itself.
+A constant limit (max line length, an architecture rule) declares
+`"baseline": "fixed"` and never moves on its own.
 
 ## Install
 
@@ -23,7 +27,7 @@ Every `v<version>` tag publishes a tarball per platform
 verify it, put the binary on your `PATH`:
 
 ```sh
-VERSION=0.6.4
+VERSION=0.8.0
 BASE="https://github.com/all-the-rest/ratchet-cli/releases/download/v$VERSION"
 ASSET="ratchet-$VERSION-macos-aarch64.tar.gz"
 curl -LO "$BASE/$ASSET"
@@ -64,7 +68,8 @@ there is one. The check is silent on failure, and is disabled with
 ratchet init                 # write a starter ratchet.config.jsonc
 $EDITOR ratchet.config.jsonc # replace the starter rule with yours (below)
 ratchet baseline init        # record the current counts as the baseline
-ratchet check                # run the gates
+ratchet check                # run the gates; auto rules tighten their baseline
+ratchet check --no-ratchet   # run without writing a baseline (CI)
 ratchet report --format md   # render the run as Markdown
 ```
 
@@ -72,10 +77,11 @@ ratchet report --format md   # render the run as Markdown
 writes `ratchet.baseline.json` for every rule without one and leaves existing
 records alone. Commit both files — the baseline is what future runs compare.
 
-From then on the loop is: make a change, run `ratchet check`, and when debt is
-paid down, run `ratchet baseline update` and commit the moved baseline. A
-failing gate is a failed gate, not one to be moved — moving a ceiling up needs
-`baseline raise` and a reason.
+From then on the loop is: make a change, run `ratchet check` — on a green run
+the baselines of auto rules move towards the count and are written, so commit
+that change with the code. A failing gate is a failed gate, not one to be
+moved: moving a baseline against its direction needs `baseline raise` with a
+reason, and a `fixed` rule never moves on its own.
 
 ## A minimal config
 
@@ -98,6 +104,9 @@ accepted too), looked up from the working directory up to the git root.
         "unit": "markers",
         // "ceiling": the count may not rise above the baseline.
         "direction": "ceiling",
+        // "auto" (default): check tightens the baseline on a green run.
+        // "fixed": a constant limit that never moves on its own.
+        "baseline": "auto",
         // When it runs: "fast" (seconds, no infrastructure) or "slow".
         "tier": "fast",
         // A command that prints one integer.  No shell is involved, so
@@ -127,15 +136,15 @@ a gate; a config object may name a shipped preset — `{ "preset": "agent-rules"
 
 | Command | What it does |
 |---|---|
-| `ratchet check [paths…]` | Run every gate and compare each count with its baseline. The default command — bare `ratchet` is the same. A path restricts the run to the rules whose `files` scope touches it. |
+| `ratchet check [paths…]` | Run every gate and compare each count with its baseline. A green run tightens the baselines of `auto` rules and writes them; `--no-ratchet` suppresses the write (for CI). The default command — bare `ratchet` is the same. A path restricts the run to the rules whose `files` scope touches it. |
 | `ratchet count` | Print the current count per rule, without a comparison. |
 | `ratchet baseline init` | Write the current count as the baseline of every rule that has none. Existing baselines are never touched. |
-| `ratchet baseline update` | Move the baseline towards the current count, in the allowed direction only (a ceiling down, a floor up). Also prunes stale records. |
-| `ratchet baseline raise --rule <id> --value <n> --reason "<text>"` | Move a baseline against its direction on purpose. The reason is required and travels into the committed diff. |
+| `ratchet baseline update` | Move the baseline towards the current count, in the allowed direction only (a ceiling down, a floor up). `check` does the same for `auto` rules. Also prunes stale records. |
+| `ratchet baseline raise --rule <id> --value <n> --reason "<text>"` | Move a `fixed` baseline against its direction on purpose. The reason is required and travels into the committed diff; `auto` rules refuse a raise. |
 | `ratchet baseline path` | Print the repository-relative path of the baseline file. |
 | `ratchet drift` | Run the drift gates — the generated files — and nothing else. `--path` restricts the run to one file. |
 | `ratchet verify` | Run the pre-release checks against their committed snapshots. `--name` runs one check, `--update` writes the produced output into the snapshot. |
-| `ratchet report` | Render the run into a Markdown report; `--output <path>` writes it into the repository. |
+| `ratchet report` | Render the run into a Markdown report; `--output <path>` writes it into the repository. It never writes a baseline. |
 | `ratchet release` | Compute the next version and the changelog block from the commits since the last release tag. It writes no tag. `--dry-run` changes nothing. |
 | `ratchet update` | Update the binary to the newest release, checksum verified. |
 | `ratchet init` | Write a starter `ratchet.config.jsonc` if none exists. |
@@ -149,6 +158,7 @@ The most useful options:
 | `--tier <fast\|slow>` | Run only the rules (and generators) of that tier — a `check` option. |
 | `--format <stylish\|json\|md>` | The output format; `stylish` is the default, `md` belongs to `report`. |
 | `--fix` | Regenerate the generated files (`check`, `drift`). The gate stays failed until the fix is committed — it measures the committed file. |
+| `--no-ratchet` | Run `check` without tightening or writing any baseline — for CI jobs that must not mutate the checkout. |
 | `--strict` | Fail closed on stale artifacts: a baseline record for a rule the config no longer has, or a scope that selects no files. |
 | `--ignore <pattern>` | Exclude matching paths from the rules' scope (repeatable). Drift gates are not excluded. |
 | `--quiet` | Only print failures. |
@@ -198,7 +208,7 @@ jobs:
       - uses: all-the-rest/ratchet-cli@v1
         with:
           mode: validate
-          version: v0.6.4   # the release the action installs
+          version: v0.8.0   # the release the action installs
           tier: fast        # optional: fast, slow, or empty for every tier
 ```
 
@@ -214,7 +224,7 @@ What the same gate is locally, before you push:
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo build && ./target/debug/ratchet check
+cargo build && ./target/debug/ratchet check --no-ratchet
 ```
 
 ## Exit codes
@@ -247,4 +257,4 @@ Windows matrix jobs.
 
 ## License
 
-Apache-2.0 — see [`LICENSE`](LICENSE). Status: pre-1.0 (`0.6.x`).
+Apache-2.0 — see [`LICENSE`](LICENSE). Status: pre-1.0 (`0.8.x`).
